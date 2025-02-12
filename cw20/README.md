@@ -1,4 +1,4 @@
-# First Token CW20 contract
+# First Token CW20 contract (Copied from MANTRA)
 
 This repository contains a sample implementation of a CW20 token contract for the CosmWasm smart contract platform. 
 CW20 is a specification for fungible tokens similar to ERC20 on Ethereum, allowing for token creation, transfer, and
