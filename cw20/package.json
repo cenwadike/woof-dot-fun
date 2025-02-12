@@ -1,0 +1,18 @@
+{
+  "name": "cw20",
+  "version": "1.0.0",
+  "description": "This is a template to build smart contracts in Rust to run inside a [Cosmos SDK](https://github.com/cosmos/cosmos-sdk) module on all chains that enable it. To understand the framework better, please read the overview in the [cosmwasm repo](https://github.com/CosmWasm/cosmwasm/blob/master/README.md), and dig into the [cosmwasm docs](https://www.cosmwasm.com). This assumes you understand the theory and just want to get coding.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@cosmjs/cosmwasm-stargate": "^0.33.0",
+    "@cosmjs/proto-signing": "^0.33.0",
+    "@cosmjs/stargate": "^0.33.0",
+    "dotenv": "^16.4.7"
+  }
+}
