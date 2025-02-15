@@ -42,9 +42,11 @@ cosmwasm-std = { version = "2.2.0", features = [
 ] }
 cw-storage-plus = "2.0.0"
 cw2 = "2.0.0"
+cw20 = "2.0.0"
 schemars = "0.8.16"
 serde = { version = "1.0.197", default-features = false, features = ["derive"] }
 thiserror = { version = "1.0.58" }
 
+token-factory = {path = "../token-factory"}
 [dev-dependencies]
 cw-multi-test = "2.0.0"
