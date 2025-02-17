@@ -1,7 +1,8 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    to_json_binary, Decimal, DepsMut, Env, MessageInfo, Response, StdError, StdResult, Uint128,
+    to_json_binary, Binary, Decimal, Deps, DepsMut, Env, MessageInfo, Response, StdError,
+    StdResult, Uint128,
 };
 use cw2::set_contract_version;
 use execute::{
@@ -10,7 +11,7 @@ use execute::{
 };
 
 use crate::error::ContractError;
-use crate::msg::{ExecuteMsg, InstantiateMsg};
+use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::state::{Config, OrderBook, CONFIG, NEXT_ORDER_ID, NEXT_TRADE_ID};
 
 // version info for migration info
@@ -196,8 +197,8 @@ pub mod execute {
 
     use crate::state::{
         Order, OrderStatus, OrderType, Pool, TokenInfo, TokenPair, Trade, BASE_PRICE,
-        MAX_TRADES_PER_USER, ORDER_BOOKS, POOLS, TOKEN_INFO, TOKEN_PAIRS, TRADES, USER_ORDERS,
-        USER_TRADES, USER_TRADE_COUNT,
+        MAX_TRADES_PER_USER, ORDERS, ORDER_BOOKS, POOLS, TOKEN_INFO, TOKEN_PAIRS, TRADES,
+        USER_ORDERS, USER_TRADES, USER_TRADE_COUNT,
     };
 
     use super::*;
@@ -369,6 +370,7 @@ pub mod execute {
         ORDER_BOOKS.save(deps.storage, pair_id.clone(), &order_book)?;
         NEXT_ORDER_ID.save(deps.storage, &(next_id + 1))?;
         USER_ORDERS.save(deps.storage, (info.sender.clone(), next_id), &order)?;
+        ORDERS.save(deps.storage, next_id, &order)?;
 
         // Try to match orders
         match_orders(deps, &env, pair_id.clone(), is_buy)?;
@@ -444,6 +446,7 @@ pub mod execute {
             (info.sender.clone(), order_id),
             &updated_order,
         )?;
+        ORDERS.save(deps.storage, order_id, &updated_order)?;
         ORDER_BOOKS.save(deps.storage, pair_id, &order_book)?;
 
         Ok(Response::new()
@@ -876,6 +879,9 @@ pub mod execute {
             sell_order,
         )?;
 
+        ORDERS.save(storage, buy_order.id, &buy_order)?;
+        ORDERS.save(storage, sell_order.id, &sell_order)?;
+
         // Create response with trade event
         Ok(Response::new()
             .add_attribute("event_type", "trade")
@@ -1296,6 +1302,18 @@ pub mod execute {
                 // Remove oldest trade
                 USER_TRADES.remove(storage, (user.clone(), count - MAX_TRADES_PER_USER as u64));
             }
+
+            // remove oldest orders
+            let order_count = USER_ORDERS
+                .keys(storage, None, None, cosmwasm_std::Order::Ascending)
+                .count();
+            if order_count >= MAX_TRADES_PER_USER {
+                USER_ORDERS.remove(
+                    storage,
+                    (user.clone(), (order_count - MAX_TRADES_PER_USER) as u64),
+                );
+            }
+
             USER_TRADES.save(storage, (user.clone(), count), &trade)?;
             USER_TRADE_COUNT.save(storage, user.clone(), &(count + 1))?;
         }
@@ -1367,15 +1385,13 @@ pub mod execute {
         use std::collections::BTreeMap;
 
         use super::*;
-        use cosmwasm_std::testing::MockQuerier;
         use cosmwasm_std::testing::{message_info, mock_dependencies, mock_env};
+        use cosmwasm_std::SubMsg;
         use cosmwasm_std::{
-            coins, from_binary, from_json, Addr, Coin, CosmosMsg, Decimal, Querier, SystemError,
-            Uint128, WasmMsg,
+            from_json, Addr, Coin, CosmosMsg, Decimal, SystemError, Uint128, WasmMsg,
         };
-        use cosmwasm_std::{ContractResult, Env, QueryRequest, StdError, SystemResult, WasmQuery};
-        use cosmwasm_std::{Response, SubMsg};
-        use cw20::{AllowanceResponse, BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg, Expiration};
+        use cosmwasm_std::{ContractResult, StdError, SystemResult, WasmQuery};
+        use cw20::{AllowanceResponse, BalanceResponse, Cw20ExecuteMsg, Expiration};
         use token_factory::contract::execute::generate_token_address;
         use token_factory::state::Cw20Coin;
 
@@ -4877,18 +4893,1582 @@ pub mod execute {
     }
 }
 
-// #[cfg_attr(not(feature = "library"), entry_point)]
-// pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
-//     match msg {
-//         QueryMsg::GetCount {} => to_json_binary(&query::count(deps)?),
-//     }
-// }
+#[cfg_attr(not(feature = "library"), entry_point)]
+pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
+    match msg {
+        // User queries
+        QueryMsg::GetUserTrades {
+            address,
+            pair_id,
+            start_after,
+            limit,
+        } => to_json_binary(&query::query_user_trades(
+            deps,
+            address,
+            pair_id,
+            start_after,
+            limit,
+        )?),
+        QueryMsg::GetUserOrders {
+            address,
+            pair_id,
+            status,
+            start_after,
+            limit,
+        } => to_json_binary(&query::query_user_orders(
+            deps,
+            address,
+            pair_id,
+            status,
+            start_after,
+            limit,
+        )?),
+        QueryMsg::GetUserTradeCount { address } => {
+            to_json_binary(&query::query_user_trade_count(deps, address)?)
+        }
 
-// pub mod query {
-//     use super::*;
+        // Order book queries
+        QueryMsg::GetOrder { order_id } => to_json_binary(&query::query_order(deps, order_id)?),
 
-//     pub fn count(deps: Deps) -> StdResult<GetCountResponse> {
-//         let state = STATE.load(deps.storage)?;
-//         Ok(GetCountResponse { count: state.count })
-//     }
-// }
+        // Order book queries
+        QueryMsg::GetOrderBook { pair_id, depth } => {
+            to_json_binary(&query::query_order_book(deps, pair_id, depth)?)
+        }
+
+        // Bonding curve pool queries and liquidity queries
+        QueryMsg::GetPool { token_address } => {
+            to_json_binary(&query::query_pool(deps, token_address)?)
+        }
+
+        // Token queries
+        QueryMsg::GetTokenInfo { token_address } => {
+            to_json_binary(&query::query_token_info(deps, token_address)?)
+        }
+
+        // Price queries
+        QueryMsg::GetCurrentPrice { token_address } => {
+            to_json_binary(&query::query_current_price(deps, token_address)?)
+        }
+
+        // Market data queries
+        QueryMsg::GetRecentTrades { start_from, limit } => {
+            to_json_binary(&query::query_recent_trades(deps, start_from, limit)?)
+        }
+
+        // Token and pair queries
+        QueryMsg::GetTokenPair { pair_id } => {
+            to_json_binary(&query::query_token_pair(deps, pair_id)?)
+        }
+        QueryMsg::ListTokenPairs { start_after, limit } => {
+            to_json_binary(&query::query_token_pairs(deps, start_after, limit)?)
+        }
+
+        // System queries
+        QueryMsg::GetConfig {} => to_json_binary(&query::query_config(deps)?),
+        QueryMsg::GetSystemStats {} => to_json_binary(&query::query_system_stats(deps)?),
+    }
+}
+
+pub mod query {
+    use cosmwasm_std::{Addr, Deps, Order as CosmwasmOrder};
+    use cw_storage_plus::Bound;
+
+    use crate::{
+        msg::{
+            GetConfigResponse, GetCountResponse, GetCurrentPriceResponse, GetOrderBookResponse,
+            GetOrderResponse, GetPoolResponse, GetRecentTradesResponse, GetSystemStatsResponse,
+            GetTokenInfoResponse, GetTokenPairResponse, GetUserOrdersResponse,
+            GetUserTradesResponse, ListTokenPairsResponse,
+        },
+        state::{
+            Order, OrderStatus, PriceLevel, TokenPair, Trade, ORDERS, ORDER_BOOKS, POOLS,
+            TOKEN_INFO, TOKEN_PAIRS, TRADES, USER_ORDERS, USER_TRADES, USER_TRADE_COUNT,
+        },
+    };
+
+    use super::*;
+
+    pub fn query_user_trades(
+        deps: Deps,
+        address: Addr,
+        pair_id: Option<String>,
+        start_from: Option<u64>,
+        limit: Option<u32>,
+    ) -> StdResult<GetUserTradesResponse> {
+        let limit = limit.unwrap_or(30) as usize;
+        let start = start_from.unwrap_or_default();
+
+        let trades: Vec<Trade> = USER_TRADES
+            .prefix(address.clone())
+            .range(
+                deps.storage,
+                Some(Bound::inclusive(start)),
+                None,
+                CosmwasmOrder::Ascending,
+            )
+            .filter(|r| {
+                if let Ok((_, trade)) = r {
+                    pair_id.as_ref().map_or(true, |p| trade.pair_id == *p)
+                } else {
+                    false
+                }
+            })
+            .take(limit)
+            .map(|item| Ok(item?.1))
+            .collect::<StdResult<Vec<Trade>>>()?;
+
+        Ok(GetUserTradesResponse { trades })
+    }
+
+    pub fn query_user_orders(
+        deps: Deps,
+        address: Addr,
+        pair_id: Option<String>,
+        status: Option<OrderStatus>,
+        start_from: Option<u64>,
+        limit: Option<u32>,
+    ) -> StdResult<GetUserOrdersResponse> {
+        let limit = limit.unwrap_or(30) as usize;
+        let start = start_from.unwrap_or_default();
+
+        let orders: Vec<Order> = USER_ORDERS
+            .prefix(address.clone())
+            .range(
+                deps.storage,
+                Some(Bound::inclusive(start)),
+                None,
+                CosmwasmOrder::Ascending,
+            )
+            .filter(|r| {
+                if let Ok((_, order)) = r {
+                    pair_id.as_ref().map_or(true, |p| order.pair_id == *p)
+                        && status.as_ref().map_or(true, |s| order.status == *s)
+                } else {
+                    false
+                }
+            })
+            .take(limit)
+            .map(|item| Ok(item?.1))
+            .collect::<StdResult<Vec<Order>>>()?;
+
+        Ok(GetUserOrdersResponse { orders })
+    }
+
+    pub fn query_user_trade_count(deps: Deps, address: Addr) -> StdResult<GetCountResponse> {
+        let count = USER_TRADE_COUNT
+            .load(deps.storage, address)
+            .unwrap_or_default();
+
+        Ok(GetCountResponse { count })
+    }
+
+    pub fn query_order(deps: Deps, order_id: u64) -> StdResult<GetOrderResponse> {
+        let order = ORDERS.load(deps.storage, order_id);
+        match order {
+            Ok(order) => Ok(GetOrderResponse { order }),
+            Err(_) => Err(StdError::not_found(order_id.to_string())),
+        }
+    }
+
+    pub fn query_order_book(
+        deps: Deps,
+        pair_id: String,
+        depth: Option<u32>,
+    ) -> StdResult<GetOrderBookResponse> {
+        let order_book = ORDER_BOOKS.load(deps.storage, pair_id.clone())?;
+        let token_pair = TOKEN_PAIRS.load(deps.storage, pair_id.clone())?;
+        let depth = depth.unwrap_or(20) as usize;
+
+        // Process buy orders (bids)
+        let bids: Vec<PriceLevel> = order_book
+            .buy_orders
+            .iter()
+            .rev()
+            .take(depth)
+            .map(|(price, orders)| {
+                let total_quantity: Uint128 = orders.iter().map(|o| o.remaining_amount).sum();
+                PriceLevel {
+                    price: Uint128::from(*price),
+                    quantity: total_quantity,
+                    order_count: orders.len() as u32,
+                }
+            })
+            .collect();
+
+        // Process sell orders (asks)
+        let asks: Vec<PriceLevel> = order_book
+            .sell_orders
+            .iter()
+            .take(depth)
+            .map(|(price, orders)| {
+                let total_quantity: Uint128 = orders.iter().map(|o| o.remaining_amount).sum();
+                PriceLevel {
+                    price: Uint128::from(*price),
+                    quantity: total_quantity,
+                    order_count: orders.len() as u32,
+                }
+            })
+            .collect();
+
+        // Get pool for last price and volume
+        let pool = POOLS.load(deps.storage, token_pair.quote_token)?;
+
+        Ok(GetOrderBookResponse {
+            pair_id,
+            bids,
+            asks,
+            last_price: pool.last_price,
+            base_volume_24h: pool.total_volume,
+            quote_volume_24h: pool.total_volume * pool.last_price,
+        })
+    }
+
+    pub fn query_pool(deps: Deps, token_address: String) -> StdResult<GetPoolResponse> {
+        let pool = POOLS.load(deps.storage, token_address.clone());
+
+        match pool {
+            Ok(pool) => Ok(GetPoolResponse { pool }),
+            Err(_) => Err(StdError::not_found(token_address)),
+        }
+    }
+
+    pub fn query_token_info(deps: Deps, token_address: String) -> StdResult<GetTokenInfoResponse> {
+        let token_info = TOKEN_INFO.load(deps.storage, token_address.clone());
+
+        match token_info {
+            Ok(token_info) => Ok(GetTokenInfoResponse { token_info }),
+            Err(_) => Err(StdError::not_found(token_address)),
+        }
+    }
+
+    pub fn query_current_price(
+        deps: Deps,
+        token_address: String,
+    ) -> StdResult<GetCurrentPriceResponse> {
+        let pool = POOLS.load(deps.storage, token_address)?;
+
+        Ok(GetCurrentPriceResponse {
+            price: pool.last_price.into(),
+        })
+    }
+
+    pub fn query_recent_trades(
+        deps: Deps,
+        start_after: Option<u64>,
+        limit: Option<u32>,
+    ) -> StdResult<GetRecentTradesResponse> {
+        let limit = limit.unwrap_or(30) as usize;
+        let start = start_after.unwrap_or_default();
+
+        let trades: Vec<Trade> = TRADES
+            .range(
+                deps.storage,
+                Some(Bound::exclusive(start)),
+                None,
+                CosmwasmOrder::Ascending,
+            )
+            .take(limit)
+            .filter_map(|item| item.ok().map(|(_, trade)| trade))
+            .collect();
+
+        Ok(GetRecentTradesResponse { trades })
+    }
+
+    pub fn query_token_pair(deps: Deps, pair_id: String) -> StdResult<GetTokenPairResponse> {
+        let token_pair = TOKEN_PAIRS.load(deps.storage, pair_id.clone());
+
+        match token_pair {
+            Ok(token_pair) => Ok(GetTokenPairResponse { token_pair }),
+            Err(_) => Err(StdError::not_found(pair_id)),
+        }
+    }
+
+    pub fn query_token_pairs(
+        deps: Deps,
+        start_after: Option<String>,
+        limit: Option<u32>,
+    ) -> StdResult<ListTokenPairsResponse> {
+        let limit = limit.unwrap_or(30) as usize;
+        let start = start_after.map(|s| Bound::exclusive(s));
+
+        let token_pairs: Vec<TokenPair> = TOKEN_PAIRS
+            .range(deps.storage, start, None, CosmwasmOrder::Ascending)
+            .take(limit)
+            .filter_map(|item| item.ok().map(|(_, token_pair)| token_pair))
+            .collect();
+
+        Ok(ListTokenPairsResponse { token_pairs })
+    }
+
+    pub fn query_config(deps: Deps) -> StdResult<GetConfigResponse> {
+        let config = CONFIG.load(deps.storage);
+
+        match config {
+            Ok(config) => Ok(GetConfigResponse { config }),
+            Err(_) => Err(StdError::not_found("config")),
+        }
+    }
+
+    pub fn query_system_stats(deps: Deps) -> StdResult<GetSystemStatsResponse> {
+        // Count total pairs
+        let total_pairs = TOKEN_PAIRS
+            .range(deps.storage, None, None, CosmwasmOrder::Ascending)
+            .count() as u64;
+
+        // Get total trades and volume from all pools
+        let mut total_trades = 0u64;
+        let mut total_volume = Uint128::zero();
+        let mut total_fees = Uint128::zero();
+
+        for item in POOLS.range(deps.storage, None, None, CosmwasmOrder::Ascending) {
+            let (_, pool) = item?;
+            total_trades += pool.total_trades.u128() as u64;
+            total_volume += pool.total_volume;
+            total_fees += pool.total_fees_collected;
+        }
+
+        // Count unique users (simplified - in production would maintain a counter)
+        let total_users = USER_TRADE_COUNT
+            .range(deps.storage, None, None, CosmwasmOrder::Ascending)
+            .count() as u64;
+
+        Ok(GetSystemStatsResponse {
+            total_pairs,
+            total_orders: NEXT_ORDER_ID.load(deps.storage)?,
+            total_trades,
+            total_volume,
+            total_users,
+            total_fees_collected: total_fees,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    use crate::contract::query::{
+        query_config, query_current_price, query_order, query_order_book, query_pool,
+        query_recent_trades, query_system_stats, query_token_info, query_token_pair,
+        query_token_pairs, query_user_orders, query_user_trade_count, query_user_trades,
+    };
+    use crate::state::{
+        Order, OrderStatus, OrderType, Pool, TokenInfo, TokenPair, Trade, ORDERS, ORDER_BOOKS,
+        POOLS, TOKEN_INFO, TOKEN_PAIRS, TRADES, USER_ORDERS, USER_TRADES, USER_TRADE_COUNT,
+    };
+    use cosmwasm_std::testing::{mock_dependencies, mock_env};
+    use cosmwasm_std::Addr;
+
+    #[test]
+    fn test_query_user_trades() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+
+        // Initialize user trades
+        let user_address = Addr::unchecked("user");
+        let trade1 = Trade {
+            id: 1,
+            pair_id: "pair1".to_string(),
+            buy_order_id: 1,
+            sell_order_id: 2,
+            buyer: user_address.clone(),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(100),
+            price: Uint128::new(10),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(1000),
+            maker_fee_amount: Uint128::new(10),
+            taker_fee_amount: Uint128::new(5),
+        };
+
+        let trade2 = Trade {
+            id: 2,
+            pair_id: "pair2".to_string(),
+            buy_order_id: 3,
+            sell_order_id: 4,
+            buyer: user_address.clone(),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(200),
+            price: Uint128::new(20),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(4000),
+            maker_fee_amount: Uint128::new(20),
+            taker_fee_amount: Uint128::new(10),
+        };
+
+        USER_TRADES
+            .save(deps.as_mut().storage, (user_address.clone(), 1), &trade1)
+            .unwrap();
+        USER_TRADES
+            .save(deps.as_mut().storage, (user_address.clone(), 2), &trade2)
+            .unwrap();
+
+        // Query trades
+        let response =
+            query_user_trades(deps.as_ref(), user_address.clone(), None, None, None).unwrap();
+
+        // Verify response
+        assert_eq!(response.trades.len(), 2);
+        assert_eq!(response.trades[0], trade1);
+        assert_eq!(response.trades[1], trade2);
+    }
+
+    #[test]
+    fn test_query_user_trades_with_pair_id() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+
+        // Initialize user trades
+        let user_address = Addr::unchecked("user");
+        let trade1 = Trade {
+            id: 1,
+            pair_id: "pair1".to_string(),
+            buy_order_id: 1,
+            sell_order_id: 2,
+            buyer: user_address.clone(),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(100),
+            price: Uint128::new(10),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(1000),
+            maker_fee_amount: Uint128::new(10),
+            taker_fee_amount: Uint128::new(5),
+        };
+
+        let trade2 = Trade {
+            id: 2,
+            pair_id: "pair2".to_string(),
+            buy_order_id: 3,
+            sell_order_id: 4,
+            buyer: user_address.clone(),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(200),
+            price: Uint128::new(20),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(4000),
+            maker_fee_amount: Uint128::new(20),
+            taker_fee_amount: Uint128::new(10),
+        };
+
+        USER_TRADES
+            .save(deps.as_mut().storage, (user_address.clone(), 1), &trade1)
+            .unwrap();
+        USER_TRADES
+            .save(deps.as_mut().storage, (user_address.clone(), 2), &trade2)
+            .unwrap();
+
+        // Query trades with pair_id
+        let response = query_user_trades(
+            deps.as_ref(),
+            user_address.clone(),
+            Some("pair1".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Verify response
+        assert_eq!(response.trades.len(), 1);
+        assert_eq!(response.trades[0], trade1);
+    }
+
+    #[test]
+    fn test_query_user_trades_with_limit() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+
+        // Initialize user trades
+        let user_address = Addr::unchecked("user");
+        let trade1 = Trade {
+            id: 1,
+            pair_id: "pair1".to_string(),
+            buy_order_id: 1,
+            sell_order_id: 2,
+            buyer: user_address.clone(),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(100),
+            price: Uint128::new(10),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(1000),
+            maker_fee_amount: Uint128::new(10),
+            taker_fee_amount: Uint128::new(5),
+        };
+
+        let trade2 = Trade {
+            id: 2,
+            pair_id: "pair2".to_string(),
+            buy_order_id: 3,
+            sell_order_id: 4,
+            buyer: user_address.clone(),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(200),
+            price: Uint128::new(20),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(4000),
+            maker_fee_amount: Uint128::new(20),
+            taker_fee_amount: Uint128::new(10),
+        };
+
+        let trade3 = Trade {
+            id: 3,
+            pair_id: "pair1".to_string(),
+            buy_order_id: 5,
+            sell_order_id: 6,
+            buyer: user_address.clone(),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(150),
+            price: Uint128::new(15),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(2250),
+            maker_fee_amount: Uint128::new(15),
+            taker_fee_amount: Uint128::new(7),
+        };
+
+        USER_TRADES
+            .save(deps.as_mut().storage, (user_address.clone(), 1), &trade1)
+            .unwrap();
+        USER_TRADES
+            .save(deps.as_mut().storage, (user_address.clone(), 2), &trade2)
+            .unwrap();
+        USER_TRADES
+            .save(deps.as_mut().storage, (user_address.clone(), 3), &trade3)
+            .unwrap();
+
+        // Query trades with limit
+        let response =
+            query_user_trades(deps.as_ref(), user_address.clone(), None, None, Some(2)).unwrap();
+
+        // Verify response
+        assert_eq!(response.trades.len(), 2);
+        assert_eq!(response.trades[0], trade1);
+        assert_eq!(response.trades[1], trade2);
+    }
+
+    #[test]
+    fn test_query_user_orders() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+
+        // Initialize user orders
+        let user_address = Addr::unchecked("user");
+        let order1 = Order {
+            id: 1,
+            owner: user_address.clone(),
+            pair_id: "pair1".to_string(),
+            token_amount: Uint128::new(100),
+            price: Uint128::new(10),
+            timestamp: env.block.time.seconds(),
+            status: OrderStatus::Active,
+            filled_amount: Uint128::zero(),
+            remaining_amount: Uint128::new(100),
+            order_type: OrderType::Buy,
+            created_at: env.block.height,
+        };
+
+        let order2 = Order {
+            id: 2,
+            owner: user_address.clone(),
+            pair_id: "pair2".to_string(),
+            token_amount: Uint128::new(200),
+            price: Uint128::new(20),
+            timestamp: env.block.time.seconds(),
+            status: OrderStatus::Filled,
+            filled_amount: Uint128::new(200),
+            remaining_amount: Uint128::zero(),
+            order_type: OrderType::Sell,
+            created_at: env.block.height,
+        };
+
+        USER_ORDERS
+            .save(deps.as_mut().storage, (user_address.clone(), 1), &order1)
+            .unwrap();
+        USER_ORDERS
+            .save(deps.as_mut().storage, (user_address.clone(), 2), &order2)
+            .unwrap();
+
+        // Query orders
+        let response =
+            query_user_orders(deps.as_ref(), user_address.clone(), None, None, None, None).unwrap();
+
+        // Verify response
+        assert_eq!(response.orders.len(), 2);
+        assert_eq!(response.orders[0], order1);
+        assert_eq!(response.orders[1], order2);
+    }
+
+    #[test]
+    fn test_query_user_orders_with_pair_id() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+
+        // Initialize user orders
+        let user_address = Addr::unchecked("user");
+        let order1 = Order {
+            id: 1,
+            owner: user_address.clone(),
+            pair_id: "pair1".to_string(),
+            token_amount: Uint128::new(100),
+            price: Uint128::new(10),
+            timestamp: env.block.time.seconds(),
+            status: OrderStatus::Active,
+            filled_amount: Uint128::zero(),
+            remaining_amount: Uint128::new(100),
+            order_type: OrderType::Buy,
+            created_at: env.block.height,
+        };
+
+        let order2 = Order {
+            id: 2,
+            owner: user_address.clone(),
+            pair_id: "pair2".to_string(),
+            token_amount: Uint128::new(200),
+            price: Uint128::new(20),
+            timestamp: env.block.time.seconds(),
+            status: OrderStatus::Filled,
+            filled_amount: Uint128::new(200),
+            remaining_amount: Uint128::zero(),
+            order_type: OrderType::Sell,
+            created_at: env.block.height,
+        };
+
+        USER_ORDERS
+            .save(deps.as_mut().storage, (user_address.clone(), 1), &order1)
+            .unwrap();
+        USER_ORDERS
+            .save(deps.as_mut().storage, (user_address.clone(), 2), &order2)
+            .unwrap();
+
+        // Query orders with pair_id
+        let response = query_user_orders(
+            deps.as_ref(),
+            user_address.clone(),
+            Some("pair1".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Verify response
+        assert_eq!(response.orders.len(), 1);
+        assert_eq!(response.orders[0], order1);
+    }
+
+    #[test]
+    fn test_query_user_orders_with_status() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+
+        // Initialize user orders
+        let user_address = Addr::unchecked("user");
+        let order1 = Order {
+            id: 1,
+            owner: user_address.clone(),
+            pair_id: "pair1".to_string(),
+            token_amount: Uint128::new(100),
+            price: Uint128::new(10),
+            timestamp: env.block.time.seconds(),
+            status: OrderStatus::Active,
+            filled_amount: Uint128::zero(),
+            remaining_amount: Uint128::new(100),
+            order_type: OrderType::Buy,
+            created_at: env.block.height,
+        };
+
+        let order2 = Order {
+            id: 2,
+            owner: user_address.clone(),
+            pair_id: "pair2".to_string(),
+            token_amount: Uint128::new(200),
+            price: Uint128::new(20),
+            timestamp: env.block.time.seconds(),
+            status: OrderStatus::Filled,
+            filled_amount: Uint128::new(200),
+            remaining_amount: Uint128::zero(),
+            order_type: OrderType::Sell,
+            created_at: env.block.height,
+        };
+
+        USER_ORDERS
+            .save(deps.as_mut().storage, (user_address.clone(), 1), &order1)
+            .unwrap();
+        USER_ORDERS
+            .save(deps.as_mut().storage, (user_address.clone(), 2), &order2)
+            .unwrap();
+
+        // Query orders with status
+        let response = query_user_orders(
+            deps.as_ref(),
+            user_address.clone(),
+            None,
+            Some(OrderStatus::Active),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Verify response
+        assert_eq!(response.orders.len(), 1);
+        assert_eq!(response.orders[0], order1);
+    }
+
+    #[test]
+    fn test_query_user_orders_with_limit() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+
+        // Initialize user orders
+        let user_address = Addr::unchecked("user");
+        let order1 = Order {
+            id: 1,
+            owner: user_address.clone(),
+            pair_id: "pair1".to_string(),
+            token_amount: Uint128::new(100),
+            price: Uint128::new(10),
+            timestamp: env.block.time.seconds(),
+            status: OrderStatus::Active,
+            filled_amount: Uint128::zero(),
+            remaining_amount: Uint128::new(100),
+            order_type: OrderType::Buy,
+            created_at: env.block.height,
+        };
+
+        let order2 = Order {
+            id: 2,
+            owner: user_address.clone(),
+            pair_id: "pair2".to_string(),
+            token_amount: Uint128::new(200),
+            price: Uint128::new(20),
+            timestamp: env.block.time.seconds(),
+            status: OrderStatus::Filled,
+            filled_amount: Uint128::new(200),
+            remaining_amount: Uint128::zero(),
+            order_type: OrderType::Sell,
+            created_at: env.block.height,
+        };
+
+        let order3 = Order {
+            id: 3,
+            owner: user_address.clone(),
+            pair_id: "pair1".to_string(),
+            token_amount: Uint128::new(150),
+            price: Uint128::new(15),
+            timestamp: env.block.time.seconds(),
+            status: OrderStatus::Active,
+            filled_amount: Uint128::zero(),
+            remaining_amount: Uint128::new(150),
+            order_type: OrderType::Buy,
+            created_at: env.block.height,
+        };
+
+        USER_ORDERS
+            .save(deps.as_mut().storage, (user_address.clone(), 1), &order1)
+            .unwrap();
+        USER_ORDERS
+            .save(deps.as_mut().storage, (user_address.clone(), 2), &order2)
+            .unwrap();
+        USER_ORDERS
+            .save(deps.as_mut().storage, (user_address.clone(), 3), &order3)
+            .unwrap();
+
+        // Query orders with limit
+        let response = query_user_orders(
+            deps.as_ref(),
+            user_address.clone(),
+            None,
+            None,
+            None,
+            Some(2),
+        )
+        .unwrap();
+
+        // Verify response
+        assert_eq!(response.orders.len(), 2);
+        assert_eq!(response.orders[0], order1);
+        assert_eq!(response.orders[1], order2);
+    }
+
+    #[test]
+    fn test_query_user_trade_count() {
+        let mut deps = mock_dependencies();
+
+        // Initialize user trade count
+        let user_address = Addr::unchecked("user");
+        USER_TRADE_COUNT
+            .save(deps.as_mut().storage, user_address.clone(), &5u64)
+            .unwrap();
+
+        // Query user trade count
+        let response = query_user_trade_count(deps.as_ref(), user_address.clone()).unwrap();
+
+        // Verify response
+        assert_eq!(response.count, 5);
+    }
+
+    #[test]
+    fn test_query_user_trade_count_not_found() {
+        let deps = mock_dependencies();
+
+        // Query user trade count for non-existent user
+        let user_address = Addr::unchecked("non_existent_user");
+        let response = query_user_trade_count(deps.as_ref(), user_address.clone()).unwrap();
+
+        // Verify response
+        assert_eq!(response.count, 0);
+    }
+
+    #[test]
+    fn test_query_order() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+
+        // Initialize an order
+        let order = Order {
+            id: 1,
+            owner: Addr::unchecked("user"),
+            pair_id: "pair1".to_string(),
+            token_amount: Uint128::new(100),
+            price: Uint128::new(10),
+            timestamp: env.block.time.seconds(),
+            status: OrderStatus::Active,
+            filled_amount: Uint128::zero(),
+            remaining_amount: Uint128::new(100),
+            order_type: OrderType::Buy,
+            created_at: env.block.height,
+        };
+
+        ORDERS.save(deps.as_mut().storage, 1, &order).unwrap();
+
+        // Query the order
+        let response = query_order(deps.as_ref(), 1).unwrap();
+
+        // Verify response
+        assert_eq!(response.order, order);
+    }
+
+    #[test]
+    fn test_query_order_not_found() {
+        let deps = mock_dependencies();
+
+        // Attempt to query a non-existent order
+        let response = query_order(deps.as_ref(), 999);
+
+        // Verify response
+        assert!(response.is_err());
+        assert_eq!(response.err().unwrap(), StdError::not_found("999"));
+    }
+
+    #[test]
+    fn test_query_order_book() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+
+        // Initialize order book
+        let mut buy_orders = BTreeMap::new();
+        buy_orders.insert(
+            Uint128::new(10).u128(),
+            vec![Order {
+                id: 1,
+                owner: Addr::unchecked("buyer1"),
+                pair_id: "pair1".to_string(),
+                token_amount: Uint128::new(100),
+                price: Uint128::new(10),
+                timestamp: env.block.time.seconds(),
+                status: OrderStatus::Active,
+                filled_amount: Uint128::zero(),
+                remaining_amount: Uint128::new(100),
+                order_type: OrderType::Buy,
+                created_at: env.block.height,
+            }],
+        );
+        buy_orders.insert(
+            Uint128::new(9).u128(),
+            vec![Order {
+                id: 2,
+                owner: Addr::unchecked("buyer2"),
+                pair_id: "pair1".to_string(),
+                token_amount: Uint128::new(200),
+                price: Uint128::new(9),
+                timestamp: env.block.time.seconds(),
+                status: OrderStatus::Active,
+                filled_amount: Uint128::zero(),
+                remaining_amount: Uint128::new(200),
+                order_type: OrderType::Buy,
+                created_at: env.block.height,
+            }],
+        );
+
+        let mut sell_orders = BTreeMap::new();
+        sell_orders.insert(
+            Uint128::new(11).u128(),
+            vec![Order {
+                id: 3,
+                owner: Addr::unchecked("seller1"),
+                pair_id: "pair1".to_string(),
+                token_amount: Uint128::new(150),
+                price: Uint128::new(11),
+                timestamp: env.block.time.seconds(),
+                status: OrderStatus::Active,
+                filled_amount: Uint128::zero(),
+                remaining_amount: Uint128::new(150),
+                order_type: OrderType::Sell,
+                created_at: env.block.height,
+            }],
+        );
+        sell_orders.insert(
+            Uint128::new(12).u128(),
+            vec![Order {
+                id: 4,
+                owner: Addr::unchecked("seller2"),
+                pair_id: "pair1".to_string(),
+                token_amount: Uint128::new(100),
+                price: Uint128::new(12),
+                timestamp: env.block.time.seconds(),
+                status: OrderStatus::Active,
+                filled_amount: Uint128::zero(),
+                remaining_amount: Uint128::new(100),
+                order_type: OrderType::Sell,
+                created_at: env.block.height,
+            }],
+        );
+
+        let order_book = OrderBook {
+            pair_id: "pair1".to_string(),
+            buy_orders,
+            sell_orders,
+        };
+
+        ORDER_BOOKS
+            .save(deps.as_mut().storage, "pair1".to_string(), &order_book)
+            .unwrap();
+
+        // Initialize pool
+        let pool = Pool {
+            pair_id: "pair1".to_string(),
+            curve_slope: Uint128::new(1),
+            token_address: Addr::unchecked("token_address"),
+            total_reserve_token: Uint128::new(1000),
+            token_sold: Uint128::new(500),
+            total_volume: Uint128::new(10000),
+            total_trades: Uint128::new(100),
+            total_fees_collected: Uint128::new(500),
+            last_price: Uint128::new(10),
+            enabled: true,
+        };
+
+        POOLS
+            .save(deps.as_mut().storage, "token_address".to_string(), &pool)
+            .unwrap();
+
+        // Initialize token pair
+        let token_pair = TokenPair {
+            base_token: "token1".to_string(),
+            quote_token: "token_address".to_string(),
+            base_decimals: 6,
+            quote_decimals: 8,
+            enabled: true,
+        };
+
+        TOKEN_PAIRS
+            .save(deps.as_mut().storage, "pair1".to_string(), &token_pair)
+            .unwrap();
+
+        // Query order book
+        let response = query_order_book(deps.as_ref(), "pair1".to_string(), Some(10)).unwrap();
+
+        // Verify response
+        assert_eq!(response.pair_id, "pair1");
+        assert_eq!(response.bids.len(), 2);
+        assert_eq!(response.bids[0].price, Uint128::new(10));
+        assert_eq!(response.bids[0].quantity, Uint128::new(100));
+        assert_eq!(response.bids[0].order_count, 1);
+        assert_eq!(response.bids[1].price, Uint128::new(9));
+        assert_eq!(response.bids[1].quantity, Uint128::new(200));
+        assert_eq!(response.bids[1].order_count, 1);
+        assert_eq!(response.asks.len(), 2);
+        assert_eq!(response.asks[0].price, Uint128::new(11));
+        assert_eq!(response.asks[0].quantity, Uint128::new(150));
+        assert_eq!(response.asks[0].order_count, 1);
+        assert_eq!(response.asks[1].price, Uint128::new(12));
+        assert_eq!(response.asks[1].quantity, Uint128::new(100));
+        assert_eq!(response.asks[1].order_count, 1);
+        assert_eq!(response.last_price, Uint128::new(10));
+        assert_eq!(response.base_volume_24h, Uint128::new(10000));
+        assert_eq!(response.quote_volume_24h, Uint128::new(100000));
+    }
+
+    #[test]
+    fn test_query_order_book_not_found() {
+        let deps = mock_dependencies();
+
+        // Attempt to query a non-existent order book
+        let response = query_order_book(deps.as_ref(), "non_existent_pair".to_string(), Some(10));
+
+        // Verify response
+        assert!(response.is_err());
+    }
+
+    #[test]
+    fn test_query_pool() {
+        let mut deps = mock_dependencies();
+
+        // Initialize a pool
+        let pool = Pool {
+            pair_id: "pair1".to_string(),
+            curve_slope: Uint128::new(1),
+            token_address: Addr::unchecked("token_address"),
+            total_reserve_token: Uint128::new(1000),
+            token_sold: Uint128::new(500),
+            total_volume: Uint128::new(10000),
+            total_trades: Uint128::new(100),
+            total_fees_collected: Uint128::new(500),
+            last_price: Uint128::new(10),
+            enabled: true,
+        };
+
+        POOLS
+            .save(deps.as_mut().storage, "token_address".to_string(), &pool)
+            .unwrap();
+
+        // Query the pool
+        let response = query_pool(deps.as_ref(), "token_address".to_string()).unwrap();
+
+        // Verify response
+        assert_eq!(response.pool, pool);
+    }
+
+    #[test]
+    fn test_query_pool_not_found() {
+        let deps = mock_dependencies();
+
+        // Attempt to query a non-existent pool
+        let response = query_pool(deps.as_ref(), "non_existent_token".to_string());
+
+        // Verify response
+        assert!(response.is_err());
+        assert_eq!(
+            response.err().unwrap(),
+            StdError::not_found("non_existent_token")
+        );
+    }
+
+    #[test]
+    fn test_query_token_info() {
+        let mut deps = mock_dependencies();
+
+        // Initialize token information
+        let token_info = TokenInfo {
+            name: "Test Token".to_string(),
+            symbol: "TT".to_string(),
+            decimals: 6,
+            total_supply: Uint128::new(1_000_000),
+            initial_price: Uint128::new(10),
+            max_price_impact: Uint128::new(100),
+            graduated: false,
+        };
+
+        TOKEN_INFO
+            .save(
+                deps.as_mut().storage,
+                "token_address".to_string(),
+                &token_info,
+            )
+            .unwrap();
+
+        // Query the token information
+        let response = query_token_info(deps.as_ref(), "token_address".to_string()).unwrap();
+
+        // Verify response
+        assert_eq!(response.token_info, token_info);
+    }
+
+    #[test]
+    fn test_query_token_info_not_found() {
+        let deps = mock_dependencies();
+
+        // Attempt to query a non-existent token
+        let response = query_token_info(deps.as_ref(), "non_existent_token".to_string());
+
+        // Verify response
+        assert!(response.is_err());
+        assert_eq!(
+            response.err().unwrap(),
+            StdError::not_found("non_existent_token")
+        );
+    }
+
+    #[test]
+    fn test_query_current_price() {
+        let mut deps = mock_dependencies();
+
+        // Initialize a pool
+        let pool = Pool {
+            pair_id: "pair1".to_string(),
+            curve_slope: Uint128::new(1),
+            token_address: Addr::unchecked("token_address"),
+            total_reserve_token: Uint128::new(1000),
+            token_sold: Uint128::new(500),
+            total_volume: Uint128::new(10000),
+            total_trades: Uint128::new(100),
+            total_fees_collected: Uint128::new(500),
+            last_price: Uint128::new(10),
+            enabled: true,
+        };
+
+        POOLS
+            .save(deps.as_mut().storage, "token_address".to_string(), &pool)
+            .unwrap();
+
+        // Query the current price
+        let response = query_current_price(deps.as_ref(), "token_address".to_string()).unwrap();
+
+        // Verify response
+        assert_eq!(response.price, 10u128);
+    }
+
+    #[test]
+    fn test_query_current_price_not_found() {
+        let deps = mock_dependencies();
+
+        // Attempt to query the current price for a non-existent pool
+        let response = query_current_price(deps.as_ref(), "non_existent_token".to_string());
+
+        // Verify response
+        assert!(response.is_err());
+    }
+
+    #[test]
+    fn test_query_recent_trades() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+
+        // Initialize trades
+        let trade1 = Trade {
+            id: 1,
+            pair_id: "pair1".to_string(),
+            buy_order_id: 1,
+            sell_order_id: 2,
+            buyer: Addr::unchecked("buyer"),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(100),
+            price: Uint128::new(10),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(1000),
+            maker_fee_amount: Uint128::new(10),
+            taker_fee_amount: Uint128::new(5),
+        };
+
+        let trade2 = Trade {
+            id: 2,
+            pair_id: "pair2".to_string(),
+            buy_order_id: 3,
+            sell_order_id: 4,
+            buyer: Addr::unchecked("buyer"),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(200),
+            price: Uint128::new(20),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(4000),
+            maker_fee_amount: Uint128::new(20),
+            taker_fee_amount: Uint128::new(10),
+        };
+
+        TRADES.save(deps.as_mut().storage, 1, &trade1).unwrap();
+        TRADES.save(deps.as_mut().storage, 2, &trade2).unwrap();
+
+        // Query recent trades
+        let response = query_recent_trades(deps.as_ref(), None, None).unwrap();
+
+        // Verify response
+        assert_eq!(response.trades.len(), 2);
+        assert_eq!(response.trades[0], trade1);
+        assert_eq!(response.trades[1], trade2);
+    }
+
+    #[test]
+    fn test_query_recent_trades_with_limit() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+
+        // Initialize trades
+        let trade1 = Trade {
+            id: 1,
+            pair_id: "pair1".to_string(),
+            buy_order_id: 1,
+            sell_order_id: 2,
+            buyer: Addr::unchecked("buyer"),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(100),
+            price: Uint128::new(10),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(1000),
+            maker_fee_amount: Uint128::new(10),
+            taker_fee_amount: Uint128::new(5),
+        };
+
+        let trade2 = Trade {
+            id: 2,
+            pair_id: "pair2".to_string(),
+            buy_order_id: 3,
+            sell_order_id: 4,
+            buyer: Addr::unchecked("buyer"),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(200),
+            price: Uint128::new(20),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(4000),
+            maker_fee_amount: Uint128::new(20),
+            taker_fee_amount: Uint128::new(10),
+        };
+
+        let trade3 = Trade {
+            id: 3,
+            pair_id: "pair1".to_string(),
+            buy_order_id: 5,
+            sell_order_id: 6,
+            buyer: Addr::unchecked("buyer"),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(150),
+            price: Uint128::new(15),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(2250),
+            maker_fee_amount: Uint128::new(15),
+            taker_fee_amount: Uint128::new(7),
+        };
+
+        TRADES.save(deps.as_mut().storage, 1, &trade1).unwrap();
+        TRADES.save(deps.as_mut().storage, 2, &trade2).unwrap();
+        TRADES.save(deps.as_mut().storage, 3, &trade3).unwrap();
+
+        // Query recent trades with limit
+        let response = query_recent_trades(deps.as_ref(), None, Some(2)).unwrap();
+
+        // Verify response
+        assert_eq!(response.trades.len(), 2);
+        assert_eq!(response.trades[0], trade1);
+        assert_eq!(response.trades[1], trade2);
+    }
+
+    #[test]
+    fn test_query_recent_trades_with_start_after() {
+        let mut deps = mock_dependencies();
+        let env = mock_env();
+
+        // Initialize trades
+        let trade1 = Trade {
+            id: 1,
+            pair_id: "pair1".to_string(),
+            buy_order_id: 1,
+            sell_order_id: 2,
+            buyer: Addr::unchecked("buyer"),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(100),
+            price: Uint128::new(10),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(1000),
+            maker_fee_amount: Uint128::new(10),
+            taker_fee_amount: Uint128::new(5),
+        };
+
+        let trade2 = Trade {
+            id: 2,
+            pair_id: "pair2".to_string(),
+            buy_order_id: 3,
+            sell_order_id: 4,
+            buyer: Addr::unchecked("buyer"),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(200),
+            price: Uint128::new(20),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(4000),
+            maker_fee_amount: Uint128::new(20),
+            taker_fee_amount: Uint128::new(10),
+        };
+
+        let trade3 = Trade {
+            id: 3,
+            pair_id: "pair1".to_string(),
+            buy_order_id: 5,
+            sell_order_id: 6,
+            buyer: Addr::unchecked("buyer"),
+            seller: Addr::unchecked("seller"),
+            token_amount: Uint128::new(150),
+            price: Uint128::new(15),
+            timestamp: env.block.time.seconds(),
+            total_price: Uint128::new(2250),
+            maker_fee_amount: Uint128::new(15),
+            taker_fee_amount: Uint128::new(7),
+        };
+
+        TRADES.save(deps.as_mut().storage, 1, &trade1).unwrap();
+        TRADES.save(deps.as_mut().storage, 2, &trade2).unwrap();
+        TRADES.save(deps.as_mut().storage, 3, &trade3).unwrap();
+
+        // Query recent trades with start_after
+        let response = query_recent_trades(deps.as_ref(), Some(1), None).unwrap();
+
+        // Verify response
+        assert_eq!(response.trades.len(), 2);
+        assert_eq!(response.trades[0], trade2);
+        assert_eq!(response.trades[1], trade3);
+    }
+
+    #[test]
+    fn test_query_token_pair() {
+        let mut deps = mock_dependencies();
+
+        // Initialize token pair
+        let token_pair = TokenPair {
+            base_token: "token1".to_string(),
+            quote_token: "token2".to_string(),
+            base_decimals: 6,
+            quote_decimals: 8,
+            enabled: true,
+        };
+
+        TOKEN_PAIRS
+            .save(deps.as_mut().storage, "pair1".to_string(), &token_pair)
+            .unwrap();
+
+        // Query token pair
+        let response = query_token_pair(deps.as_ref(), "pair1".to_string()).unwrap();
+
+        // Verify response
+        assert_eq!(response.token_pair, token_pair);
+    }
+
+    #[test]
+    fn test_query_token_pair_not_found() {
+        let deps = mock_dependencies();
+
+        // Attempt to query a non-existent token pair
+        let response = query_token_pair(deps.as_ref(), "non_existent_pair".to_string());
+
+        // Verify response
+        assert!(response.is_err());
+        assert_eq!(
+            response.err().unwrap(),
+            StdError::not_found("non_existent_pair")
+        );
+    }
+
+    #[test]
+    fn test_list_token_pairs() {
+        let mut deps = mock_dependencies();
+
+        // Initialize token pairs
+        let token_pair1 = TokenPair {
+            base_token: "token1".to_string(),
+            quote_token: "token2".to_string(),
+            base_decimals: 6,
+            quote_decimals: 8,
+            enabled: true,
+        };
+
+        let token_pair2 = TokenPair {
+            base_token: "token3".to_string(),
+            quote_token: "token4".to_string(),
+            base_decimals: 6,
+            quote_decimals: 8,
+            enabled: true,
+        };
+
+        TOKEN_PAIRS
+            .save(deps.as_mut().storage, "pair1".to_string(), &token_pair1)
+            .unwrap();
+        TOKEN_PAIRS
+            .save(deps.as_mut().storage, "pair2".to_string(), &token_pair2)
+            .unwrap();
+
+        // Query token pairs
+        let response = query_token_pairs(deps.as_ref(), None, None).unwrap();
+
+        // Verify response
+        assert_eq!(response.token_pairs.len(), 2);
+        assert_eq!(response.token_pairs[0], token_pair1);
+        assert_eq!(response.token_pairs[1], token_pair2);
+    }
+
+    #[test]
+    fn test_list_token_pairs_with_limit() {
+        let mut deps = mock_dependencies();
+
+        // Initialize token pairs
+        let token_pair1 = TokenPair {
+            base_token: "token1".to_string(),
+            quote_token: "token2".to_string(),
+            base_decimals: 6,
+            quote_decimals: 8,
+            enabled: true,
+        };
+
+        let token_pair2 = TokenPair {
+            base_token: "token3".to_string(),
+            quote_token: "token4".to_string(),
+            base_decimals: 6,
+            quote_decimals: 8,
+            enabled: true,
+        };
+
+        TOKEN_PAIRS
+            .save(deps.as_mut().storage, "pair1".to_string(), &token_pair1)
+            .unwrap();
+        TOKEN_PAIRS
+            .save(deps.as_mut().storage, "pair2".to_string(), &token_pair2)
+            .unwrap();
+
+        // Query token pairs with limit
+        let response = query_token_pairs(deps.as_ref(), None, Some(1)).unwrap();
+
+        // Verify response
+        assert_eq!(response.token_pairs.len(), 1);
+        assert_eq!(response.token_pairs[0], token_pair1);
+    }
+
+    #[test]
+    fn test_query_config() {
+        let mut deps = mock_dependencies();
+
+        // Initialize configuration
+        let config = Config {
+            owner: Addr::unchecked("owner"),
+            token_factory: Addr::unchecked("token_factory"),
+            fee_collector: Addr::unchecked("fee_collector"),
+            trading_fee: Decimal::percent(1),
+            quote_token_total_supply: 100_000_000_000,
+            bonding_curve_supply: 80_000_000_000,
+            lp_supply: 20_000_000_000,
+            maker_fee: Decimal::percent(1),
+            taker_fee: Decimal::percent(1),
+            enabled: true,
+            secondary_amm_address: Addr::unchecked("secondary_amm"),
+            base_token_denom: "ubase_token".to_string(),
+        };
+
+        CONFIG.save(deps.as_mut().storage, &config).unwrap();
+
+        // Query the configuration
+        let response = query_config(deps.as_ref()).unwrap();
+
+        // Verify response
+        assert_eq!(response.config, config);
+    }
+
+    #[test]
+    fn test_query_config_not_found() {
+        let deps = mock_dependencies();
+
+        // Attempt to query a configuration that has not been initialized
+        let response = query_config(deps.as_ref());
+
+        // Verify response
+        assert!(response.is_err());
+        assert_eq!(response.err().unwrap(), StdError::not_found("config"));
+    }
+
+    #[test]
+    fn test_query_system_stats() {
+        let mut deps = mock_dependencies();
+
+        // Initialize token pairs
+        let token_pair1 = TokenPair {
+            base_token: "token1".to_string(),
+            quote_token: "token2".to_string(),
+            base_decimals: 6,
+            quote_decimals: 8,
+            enabled: true,
+        };
+
+        let token_pair2 = TokenPair {
+            base_token: "token3".to_string(),
+            quote_token: "token4".to_string(),
+            base_decimals: 6,
+            quote_decimals: 8,
+            enabled: true,
+        };
+
+        TOKEN_PAIRS
+            .save(deps.as_mut().storage, "pair1".to_string(), &token_pair1)
+            .unwrap();
+        TOKEN_PAIRS
+            .save(deps.as_mut().storage, "pair2".to_string(), &token_pair2)
+            .unwrap();
+
+        // Initialize pools
+        let pool1 = Pool {
+            pair_id: "pair1".to_string(),
+            curve_slope: Uint128::new(1),
+            token_address: Addr::unchecked("token_address1"),
+            total_reserve_token: Uint128::new(1000),
+            token_sold: Uint128::new(500),
+            total_volume: Uint128::new(10000),
+            total_trades: Uint128::new(50),
+            total_fees_collected: Uint128::new(500),
+            last_price: Uint128::new(10),
+            enabled: true,
+        };
+
+        let pool2 = Pool {
+            pair_id: "pair2".to_string(),
+            curve_slope: Uint128::new(1),
+            token_address: Addr::unchecked("token_address2"),
+            total_reserve_token: Uint128::new(2000),
+            token_sold: Uint128::new(1000),
+            total_volume: Uint128::new(20000),
+            total_trades: Uint128::new(100),
+            total_fees_collected: Uint128::new(1000),
+            last_price: Uint128::new(20),
+            enabled: true,
+        };
+
+        POOLS
+            .save(deps.as_mut().storage, "token_address1".to_string(), &pool1)
+            .unwrap();
+        POOLS
+            .save(deps.as_mut().storage, "token_address2".to_string(), &pool2)
+            .unwrap();
+
+        // Initialize user trade counts
+        USER_TRADE_COUNT
+            .save(deps.as_mut().storage, Addr::unchecked("user1"), &10u64)
+            .unwrap();
+        USER_TRADE_COUNT
+            .save(deps.as_mut().storage, Addr::unchecked("user2"), &20u64)
+            .unwrap();
+
+        // Initialize next order ID
+        NEXT_ORDER_ID.save(deps.as_mut().storage, &100u64).unwrap();
+
+        // Query system stats
+        let response = query_system_stats(deps.as_ref()).unwrap();
+
+        // Verify response
+        assert_eq!(response.total_pairs, 2);
+        assert_eq!(response.total_orders, 100);
+        assert_eq!(response.total_trades, 150);
+        assert_eq!(response.total_volume, Uint128::new(30000));
+        assert_eq!(response.total_users, 2);
+        assert_eq!(response.total_fees_collected, Uint128::new(1500));
+    }
+
+    #[test]
+    fn test_query_system_stats_empty() {
+        let mut deps = mock_dependencies();
+
+        // Initialize next order ID
+        NEXT_ORDER_ID.save(deps.as_mut().storage, &0u64).unwrap();
+
+        // Query system stats
+        let response = query_system_stats(deps.as_ref()).unwrap();
+
+        // Verify response
+        assert_eq!(response.total_pairs, 0);
+        assert_eq!(response.total_orders, 0);
+        assert_eq!(response.total_trades, 0);
+        assert_eq!(response.total_volume, Uint128::zero());
+        assert_eq!(response.total_users, 0);
+        assert_eq!(response.total_fees_collected, Uint128::zero());
+    }
+}

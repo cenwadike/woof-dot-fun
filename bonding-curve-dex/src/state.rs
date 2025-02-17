@@ -7,7 +7,7 @@ use cosmwasm_std::{Addr, Decimal, Uint128};
 use cw_storage_plus::{Item, Map};
 
 // Add constants for data structure limits
-pub const MAX_ORDERS_PER_PRICE: usize = 10_000;
+pub const MAX_ORDERS_PER_PRICE: usize = 100_000;
 pub const MAX_TRADES_PER_USER: usize = 100;
 pub const MAX_ACTIVE_ORDERS_PER_USER: usize = 50;
 pub const PRUNE_THRESHOLD: u64 = 7 * 24 * 60 * 60; // 7 days in seconds
@@ -115,24 +115,6 @@ pub struct Pool {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
-pub enum TimeFrame {
-    Hour,
-    Day,
-    Week,
-    Month,
-}
-
-// market data structure
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-pub struct MarketData {
-    pub high: Uint128,
-    pub low: Uint128,
-    pub volume: Uint128,
-    pub price_change: i64,
-    pub timestamp: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct TokenPair {
     pub base_token: String,  // Native or CW20 token address
     pub quote_token: String, // Native or CW20 token address
@@ -141,11 +123,19 @@ pub struct TokenPair {
     pub enabled: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct PriceLevel {
+    pub price: Uint128,
+    pub quantity: Uint128,
+    pub order_count: u32,
+}
+
 // Storage items
 pub const CONFIG: Item<Config> = Item::new("config");
 pub const TOKEN_PAIRS: Map<String, TokenPair> = Map::new("token_pairs");
 pub const ORDER_BOOKS: Map<String, OrderBook> = Map::new("order_books");
 pub const TRADES: Map<u64, Trade> = Map::new("trades");
+pub const ORDERS: Map<u64, Order> = Map::new("orders");
 pub const POOLS: Map<String, Pool> = Map::new("pools");
 pub const NEXT_ORDER_ID: Item<u64> = Item::new("next_order_id");
 pub const NEXT_TRADE_ID: Item<u64> = Item::new("next_trade_id");
