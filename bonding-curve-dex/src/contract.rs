@@ -36,8 +36,7 @@ pub fn instantiate(
     }
 
     // Validate non-negative values
-    if msg.trading_fee_rate < Decimal::zero()
-        || msg.quote_token_total_supply.is_zero()
+    if msg.quote_token_total_supply.is_zero()
         || msg.bonding_curve_supply.is_zero()
         || msg.lp_supply.is_zero()
         || msg.maker_fee.is_zero()
@@ -49,7 +48,7 @@ pub fn instantiate(
     }
 
     // Validate that the trading fee rate is within acceptable range
-    if msg.trading_fee_rate > Decimal::one() {
+    if msg.maker_fee> Decimal::one() || msg.taker_fee > Decimal::one() {
         return Err(StdError::generic_err(
             "Trading fee rate must be between 0 and 1.",
         ));
@@ -66,13 +65,12 @@ pub fn instantiate(
         owner: info.sender.clone(),
         token_factory: msg.token_factory.clone(),
         fee_collector: msg.fee_collector.clone(),
-        trading_fee: msg.trading_fee_rate.clone(),
         enabled: true,
         quote_token_total_supply: msg.quote_token_total_supply.clone().into(),
         bonding_curve_supply: msg.bonding_curve_supply.clone().into(),
         lp_supply: msg.lp_supply.clone().into(),
-        maker_fee: Decimal::from_ratio(msg.maker_fee.clone(), Uint128::one()),
-        taker_fee: Decimal::from_ratio(msg.taker_fee.clone(), Uint128::one()),
+        maker_fee: msg.maker_fee.clone(),
+        taker_fee: msg.taker_fee.clone(),
         secondary_amm_address: msg.secondary_amm_address.clone(),
         base_token_denom: msg.base_token_denom.clone(),
     };
@@ -85,7 +83,6 @@ pub fn instantiate(
         .add_attribute("action", "instantiate")
         .add_attribute("owner", info.sender)
         .add_attribute("token_factory", msg.token_factory.to_string())
-        .add_attribute("trading_fee_rate", msg.trading_fee_rate.to_string())
         .add_attribute("fee_collector", msg.fee_collector.to_string())
         .add_attribute(
             "quote_token_total_supply",
@@ -162,7 +159,8 @@ pub fn execute(
         ExecuteMsg::UpdateConfig {
             token_factory,
             fee_collector,
-            trading_fee_rate,
+            maker_fee,
+            taker_fee,
             quote_token_total_supply,
             bonding_curve_supply,
             lp_supply,
@@ -173,7 +171,8 @@ pub fn execute(
             info,
             token_factory,
             fee_collector,
-            trading_fee_rate,
+            maker_fee,
+            taker_fee,
             quote_token_total_supply,
             bonding_curve_supply,
             lp_supply,
@@ -586,7 +585,8 @@ pub mod execute {
         info: MessageInfo,
         token_factory: Option<Addr>,
         fee_collector: Option<Addr>,
-        trading_fee_rate: Option<Decimal>,
+        maker_fee: Option<Decimal>,
+        taker_fee: Option<Decimal>,
         quote_token_total_supply: Option<Uint128>,
         bonding_curve_supply: Option<Uint128>,
         lp_supply: Option<Uint128>,
@@ -608,8 +608,16 @@ pub mod execute {
             config.fee_collector = fee_collector.unwrap();
         }
 
-        if trading_fee_rate.is_some() {
-            config.trading_fee = trading_fee_rate.unwrap();
+        if maker_fee.is_some() {
+            assert!(!maker_fee.unwrap().is_zero());
+            assert!(maker_fee.unwrap() < Decimal::one());
+            config.maker_fee = maker_fee.unwrap();
+        }
+
+        if taker_fee.is_some() {
+            assert!(!taker_fee.unwrap().is_zero());
+            assert!(taker_fee.unwrap() < Decimal::one());
+            config.taker_fee = taker_fee.unwrap();
         }
 
         if quote_token_total_supply.is_some() {
@@ -1402,12 +1410,11 @@ pub mod execute {
             let msg = InstantiateMsg {
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee_rate: Decimal::percent(1), // 1%
                 quote_token_total_supply: Uint128::from(100_000_000_000u128),
                 bonding_curve_supply: Uint128::from(80_000_000_000u128),
                 lp_supply: Uint128::from(20_000_000_000u128),
-                maker_fee: Uint128::from(1u128),
-                taker_fee: Uint128::from(1u128),
+                maker_fee: Decimal::percent(1),
+                taker_fee: Decimal::percent(1),
                 secondary_amm_address: Addr::unchecked("secondary_amm_addr"),
                 base_token_denom: "uhuahua".to_string(),
             };
@@ -1418,47 +1425,60 @@ pub mod execute {
             let res = instantiate(deps.as_mut(), mock_env(), info.clone(), msg.clone()).unwrap();
 
             // Check the response
-            assert_eq!(res.attributes.len(), 12);
+        // .add_attribute("token_factory", msg.token_factory.to_string())
+        // .add_attribute("fee_collector", msg.fee_collector.to_string())
+        // .add_attribute(
+        //     "quote_token_total_supply",
+        //     msg.quote_token_total_supply.to_string(),
+        // )
+        // .add_attribute("bonding_curve_supply", msg.bonding_curve_supply.to_string())
+        // .add_attribute("lp_supply", msg.lp_supply.to_string())
+        // .add_attribute("maker_fee", msg.maker_fee.to_string())
+        // .add_attribute("taker_fee", msg.taker_fee.to_string())
+        // .add_attribute(
+        //     "secondary_amm_address",
+        //     msg.secondary_amm_address.to_string(),
+        // )
+        // .add_attribute("base_token_denom", msg.base_token_denom))
+
+            assert_eq!(res.attributes.len(), 11);
             assert_eq!(res.attributes[0].key, "action");
             assert_eq!(res.attributes[0].value, "instantiate");
             assert_eq!(res.attributes[1].key, "owner");
             assert_eq!(res.attributes[1].value, info.sender.to_string());
             assert_eq!(res.attributes[2].key, "token_factory");
             assert_eq!(res.attributes[2].value, msg.token_factory.to_string());
-            assert_eq!(res.attributes[3].key, "trading_fee_rate");
-            assert_eq!(res.attributes[3].value, msg.trading_fee_rate.to_string());
-            assert_eq!(res.attributes[4].key, "fee_collector");
-            assert_eq!(res.attributes[4].value, msg.fee_collector.to_string());
-            assert_eq!(res.attributes[5].key, "quote_token_total_supply");
+            assert_eq!(res.attributes[3].key, "fee_collector");
+            assert_eq!(res.attributes[3].value, msg.fee_collector.to_string());
+            assert_eq!(res.attributes[4].key, "quote_token_total_supply");
             assert_eq!(
-                res.attributes[5].value,
+                res.attributes[4].value,
                 msg.quote_token_total_supply.to_string()
             );
-            assert_eq!(res.attributes[6].key, "bonding_curve_supply");
+            assert_eq!(res.attributes[5].key, "bonding_curve_supply");
             assert_eq!(
-                res.attributes[6].value,
+                res.attributes[5].value,
                 msg.bonding_curve_supply.to_string()
             );
-            assert_eq!(res.attributes[7].key, "lp_supply");
-            assert_eq!(res.attributes[7].value, msg.lp_supply.to_string());
-            assert_eq!(res.attributes[8].key, "maker_fee");
-            assert_eq!(res.attributes[8].value, msg.maker_fee.to_string());
-            assert_eq!(res.attributes[9].key, "taker_fee");
-            assert_eq!(res.attributes[9].value, msg.taker_fee.to_string());
-            assert_eq!(res.attributes[10].key, "secondary_amm_address");
+            assert_eq!(res.attributes[6].key, "lp_supply");
+            assert_eq!(res.attributes[6].value, msg.lp_supply.to_string());
+            assert_eq!(res.attributes[7].key, "maker_fee");
+            assert_eq!(res.attributes[7].value, msg.maker_fee.to_string());
+            assert_eq!(res.attributes[8].key, "taker_fee");
+            assert_eq!(res.attributes[8].value, msg.taker_fee.to_string());
+            assert_eq!(res.attributes[9].key, "secondary_amm_address");
             assert_eq!(
-                res.attributes[10].value,
+                res.attributes[9].value,
                 msg.secondary_amm_address.to_string()
             );
-            assert_eq!(res.attributes[11].key, "base_token_denom");
-            assert_eq!(res.attributes[11].value, msg.base_token_denom.to_string());
+            assert_eq!(res.attributes[10].key, "base_token_denom");
+            assert_eq!(res.attributes[10].value, msg.base_token_denom.to_string());
 
             // Verify state was set correctly
             let config = CONFIG.load(&deps.storage).unwrap();
             assert_eq!(config.owner, info.sender);
             assert_eq!(config.token_factory, msg.token_factory);
             assert_eq!(config.fee_collector, msg.fee_collector);
-            assert_eq!(config.trading_fee, msg.trading_fee_rate);
             assert_eq!(config.enabled, true);
             assert_eq!(
                 config.quote_token_total_supply,
@@ -1468,11 +1488,11 @@ pub mod execute {
             assert_eq!(config.lp_supply, msg.lp_supply.into());
             assert_eq!(
                 config.maker_fee,
-                Decimal::from_ratio(msg.maker_fee, Uint128::one())
+                msg.maker_fee,
             );
             assert_eq!(
                 config.taker_fee,
-                Decimal::from_ratio(msg.taker_fee, Uint128::one())
+                msg.taker_fee,
             );
             assert_eq!(config.secondary_amm_address, msg.secondary_amm_address);
             assert_eq!(config.base_token_denom, msg.base_token_denom);
@@ -1494,7 +1514,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -1654,7 +1673,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -1759,7 +1777,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -1858,7 +1875,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -2016,7 +2032,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -2203,7 +2218,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: false, // Trading disabled
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -2255,7 +2269,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -2320,7 +2333,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -2438,7 +2450,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -2570,7 +2581,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -2720,7 +2730,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -3124,7 +3133,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -3230,7 +3238,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -3371,7 +3378,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -3472,7 +3478,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -3573,7 +3578,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -3663,7 +3667,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -3758,7 +3761,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -3853,7 +3855,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -3971,7 +3972,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -4094,7 +4094,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -4221,7 +4220,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -4317,7 +4315,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -4439,7 +4436,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -4578,7 +4574,6 @@ pub mod execute {
                 owner: Addr::unchecked("creator"),
                 token_factory: Addr::unchecked("token_factory_addr"),
                 fee_collector: Addr::unchecked("fee_collector_addr"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -4685,7 +4680,6 @@ pub mod execute {
                 owner: Addr::unchecked("owner"),
                 token_factory: Addr::unchecked("initial_factory"),
                 fee_collector: Addr::unchecked("initial_collector"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: Uint128::new(100_000_000_000).into(),
                 bonding_curve_supply: Uint128::new(80_000_000_000).into(),
@@ -4814,7 +4808,6 @@ pub mod execute {
                 owner: Addr::unchecked("owner"),
                 token_factory: Addr::unchecked("initial_factory"),
                 fee_collector: Addr::unchecked("initial_collector"),
-                trading_fee: Decimal::percent(1),
                 enabled: true,
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
@@ -4834,6 +4827,7 @@ pub mod execute {
                 non_owner_info.clone(),
                 Some(Addr::unchecked("new_factory")),
                 Some(Addr::unchecked("new_collector")),
+                Some(Decimal::percent(2)),
                 Some(Decimal::percent(2)),
                 Some(Uint128::new(200_000_000_000)),
                 Some(Uint128::new(160_000_000_000)),
@@ -4855,6 +4849,7 @@ pub mod execute {
                 Some(Addr::unchecked("new_factory")),
                 Some(Addr::unchecked("new_collector")),
                 Some(Decimal::percent(2)),
+                Some(Decimal::percent(2)),
                 Some(Uint128::new(200_000_000_000)),
                 Some(Uint128::new(160_000_000_000)),
                 Some(Uint128::new(40_000_000_000)),
@@ -4875,7 +4870,8 @@ pub mod execute {
                 updated_config.fee_collector,
                 Addr::unchecked("new_collector")
             );
-            assert_eq!(updated_config.trading_fee, Decimal::percent(2));
+            assert_eq!(updated_config.maker_fee, Decimal::percent(2));
+            assert_eq!(updated_config.taker_fee, Decimal::percent(2));
             assert_eq!(
                 updated_config.quote_token_total_supply,
                 Uint128::new(200_000_000_000).into()
@@ -6336,7 +6332,6 @@ mod tests {
             owner: Addr::unchecked("owner"),
             token_factory: Addr::unchecked("token_factory"),
             fee_collector: Addr::unchecked("fee_collector"),
-            trading_fee: Decimal::percent(1),
             quote_token_total_supply: 100_000_000_000,
             bonding_curve_supply: 80_000_000_000,
             lp_supply: 20_000_000_000,

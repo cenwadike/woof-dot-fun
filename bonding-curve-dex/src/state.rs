@@ -21,12 +21,11 @@ pub struct Config {
     pub owner: Addr,
     pub token_factory: Addr,
     pub fee_collector: Addr,
-    pub trading_fee: Decimal, // in basis points (1/10000)
     pub quote_token_total_supply: u128,
     pub bonding_curve_supply: u128,
     pub lp_supply: u128,
-    pub maker_fee: Decimal,
-    pub taker_fee: Decimal,
+    pub maker_fee: Decimal, // in basis points (1/10000)
+    pub taker_fee: Decimal, // in basis points (1/10000)
     pub enabled: bool,
     pub secondary_amm_address: Addr,
     pub base_token_denom: String,

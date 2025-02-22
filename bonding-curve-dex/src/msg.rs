@@ -9,12 +9,11 @@ use crate::state::{
 pub struct InstantiateMsg {
     pub token_factory: Addr,
     pub fee_collector: Addr,
-    pub trading_fee_rate: Decimal,
     pub quote_token_total_supply: Uint128,
     pub bonding_curve_supply: Uint128,
     pub lp_supply: Uint128,
-    pub maker_fee: Uint128,
-    pub taker_fee: Uint128,
+    pub maker_fee: Decimal,
+    pub taker_fee: Decimal,
     pub secondary_amm_address: Addr,
     pub base_token_denom: String,
 }
@@ -51,7 +50,8 @@ pub enum ExecuteMsg {
     UpdateConfig {
         token_factory: Option<Addr>,
         fee_collector: Option<Addr>,
-        trading_fee_rate: Option<Decimal>,
+        maker_fee: Option<Decimal>,
+        taker_fee: Option<Decimal>,
         quote_token_total_supply: Option<Uint128>,
         bonding_curve_supply: Option<Uint128>,
         lp_supply: Option<Uint128>,
