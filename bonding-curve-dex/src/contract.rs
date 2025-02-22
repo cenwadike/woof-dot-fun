@@ -1425,22 +1425,6 @@ pub mod execute {
             let res = instantiate(deps.as_mut(), mock_env(), info.clone(), msg.clone()).unwrap();
 
             // Check the response
-        // .add_attribute("token_factory", msg.token_factory.to_string())
-        // .add_attribute("fee_collector", msg.fee_collector.to_string())
-        // .add_attribute(
-        //     "quote_token_total_supply",
-        //     msg.quote_token_total_supply.to_string(),
-        // )
-        // .add_attribute("bonding_curve_supply", msg.bonding_curve_supply.to_string())
-        // .add_attribute("lp_supply", msg.lp_supply.to_string())
-        // .add_attribute("maker_fee", msg.maker_fee.to_string())
-        // .add_attribute("taker_fee", msg.taker_fee.to_string())
-        // .add_attribute(
-        //     "secondary_amm_address",
-        //     msg.secondary_amm_address.to_string(),
-        // )
-        // .add_attribute("base_token_denom", msg.base_token_denom))
-
             assert_eq!(res.attributes.len(), 11);
             assert_eq!(res.attributes[0].key, "action");
             assert_eq!(res.attributes[0].value, "instantiate");
