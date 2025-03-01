@@ -48,7 +48,7 @@ pub fn instantiate(
     }
 
     // Validate that the trading fee rate is within acceptable range
-    if msg.maker_fee> Decimal::one() || msg.taker_fee > Decimal::one() {
+    if msg.maker_fee > Decimal::one() || msg.taker_fee > Decimal::one() {
         return Err(StdError::generic_err(
             "Trading fee rate must be between 0 and 1.",
         ));
@@ -189,7 +189,7 @@ pub mod execute {
     use std::str::FromStr;
 
     use cosmwasm_std::{
-        attr, Addr, BankMsg, Coin, CosmosMsg, Decimal, Deps, StdError, Storage, Uint128, WasmMsg,
+        attr, Addr, BankMsg, Coin, CosmosMsg, Decimal, Deps, StdError, Storage, SubMsg, Uint128, WasmMsg
     };
     use cw20::Cw20ExecuteMsg;
     use token_factory::{contract::execute::generate_token_address, state::Cw20Coin};
@@ -651,37 +651,34 @@ pub mod execute {
         let config = CONFIG.load(deps.storage)?;
         let token_pair = TOKEN_PAIRS.load(deps.storage, pair_id.clone())?;
         let mut next_trade_id = NEXT_TRADE_ID.load(deps.storage)?;
-
+    
         let mut response = Response::new();
-
+        let mut messages: Vec<SubMsg> = vec![];
+    
         if is_buy {
             for (buy_price, buy_orders) in order_book.buy_orders.iter_mut().rev() {
                 for buy_order in buy_orders.iter_mut() {
                     if buy_order.remaining_amount.is_zero() {
                         continue;
                     }
-
                     for (sell_price, sell_orders) in order_book.sell_orders.iter_mut() {
                         if sell_price > buy_price {
                             break;
                         }
-
                         for sell_order in sell_orders.iter_mut() {
                             if sell_order.remaining_amount.is_zero() {
                                 continue;
                             }
-
-                            // Create trade and merge responses
                             let trade_response = create_order(
                                 deps.storage,
+                                env,
                                 buy_order,
                                 sell_order,
                                 next_trade_id,
                                 &token_pair,
                                 &config,
-                                env,
                             )?;
-
+                            messages.extend(trade_response.messages);
                             response = response.add_attributes(trade_response.attributes);
                             next_trade_id += 1;
                         }
@@ -694,28 +691,24 @@ pub mod execute {
                     if sell_order.remaining_amount.is_zero() {
                         continue;
                     }
-
                     for (buy_price, buy_orders) in order_book.buy_orders.iter_mut().rev() {
                         if buy_price < sell_price {
                             break;
                         }
-
                         for buy_order in buy_orders.iter_mut() {
                             if buy_order.remaining_amount.is_zero() {
                                 continue;
                             }
-
-                            // Create trade and merge responses
                             let trade_response = create_order(
                                 deps.storage,
+                                env,
                                 buy_order,
                                 sell_order,
                                 next_trade_id,
                                 &token_pair,
                                 &config,
-                                env,
                             )?;
-
+                            messages.extend(trade_response.messages);
                             response = response.add_attributes(trade_response.attributes);
                             next_trade_id += 1;
                         }
@@ -723,15 +716,12 @@ pub mod execute {
                 }
             }
         }
-
-        // Clean up filled orders
+    
         clean_up_order_book(&mut order_book);
-
-        // Save updated state
         ORDER_BOOKS.save(deps.storage, pair_id, &order_book)?;
         NEXT_TRADE_ID.save(deps.storage, &next_trade_id)?;
-
-        Ok(response)
+    
+        Ok(response.add_submessages(messages))
     }
 
     fn validate_and_handle_tokens(
@@ -835,63 +825,126 @@ pub mod execute {
         Ok(())
     }
 
+    /// Creates a trade between a buy order and a sell order, executing token transfers for both parties.
+    ///
+    /// This function handles the matching of a buy order (wanting quote tokens) with a sell order (wanting base tokens),
+    /// ensuring that tokens are exchanged correctly: the buyer receives quote tokens (CW20), and the seller receives
+    /// base tokens (native, e.g., "uhuahua"), with fees deducted and sent to the fee collector.
+    ///
+    /// # Arguments
+    /// * `storage` - Mutable storage reference for updating order states.
+    /// * `env` - Environment info, including block time and contract address.
+    /// * `buy_order` - The buy order being matched (buyer wants quote tokens).
+    /// * `sell_order` - The sell order being matched (seller wants base tokens).
+    /// * `trade_id` - Unique identifier for this trade.
+    /// * `token_pair` - Pair info defining base (native) and quote (CW20) tokens.
+    /// * `config` - Contract configuration with fee rates and collector address.
+    ///
+    /// # Returns
+    /// A `StdResult<Response>` containing transfer messages and trade attributes.
     fn create_order(
         storage: &mut dyn Storage,
+        env: &Env,
         buy_order: &mut Order,
         sell_order: &mut Order,
         trade_id: u64,
         token_pair: &TokenPair,
         config: &Config,
-        env: &Env,
     ) -> StdResult<Response> {
-        // Calculate the trade amount (minimum of remaining amounts)
+        // Determine the trade amount as the lesser of the remaining amounts from both orders
         let trade_amount = std::cmp::min(buy_order.remaining_amount, sell_order.remaining_amount);
 
-        // Use the sell order price for the trade (price-time priority)
+        // Use the sell order's price as the trade price (price-time priority)
         let trade_price = sell_order.price;
-        let total_price = trade_amount * trade_price;
 
-        // Calculate fees - maker gets a lower fee rate than taker
-        let maker_fee_rate = config.maker_fee.to_uint_ceil();
-        let taker_fee_rate = config.taker_fee.to_uint_ceil();
+        // Calculate total cost in base tokens (price * amount)
+        let total_price = trade_amount
+            .checked_mul(trade_price)
+            .map_err(|e| StdError::overflow(e))?;
 
-        // Determine maker and taker based on order timestamps
+        // Calculate maker and taker fees based on order timestamps
+        // - Maker gets lower fee (older order), taker gets higher fee (newer order)
         let (maker_fee_amount, taker_fee_amount) = if buy_order.timestamp < sell_order.timestamp {
-            let maker_fee = (total_price * maker_fee_rate) / Uint128::from(10000u64);
-            let taker_fee = (total_price * taker_fee_rate) / Uint128::from(10000u64);
-            (maker_fee, taker_fee)
+            (
+                (Decimal::new(total_price) * config.maker_fee).to_uint_ceil(), // Buy order is maker
+                (Decimal::new(total_price) * config.taker_fee).to_uint_ceil(), // Sell order is taker
+            )
         } else {
-            let maker_fee = (total_price * maker_fee_rate) / Uint128::from(10000u64);
-            let taker_fee = (total_price * taker_fee_rate) / Uint128::from(10000u64);
-            (taker_fee, maker_fee)
+            (
+                (Decimal::new(total_price) * config.taker_fee).to_uint_ceil(), // Buy order is taker
+                (Decimal::new(total_price) * config.maker_fee).to_uint_ceil(), // Sell order is maker
+            )
         };
 
-        // Update order amounts
-        buy_order.remaining_amount -= trade_amount;
-        buy_order.filled_amount += trade_amount;
+        // Calculate amounts to transfer after fees
+        let buyer_receives = trade_amount; // Buyer gets full quote token amount they bought
+        let seller_receives = total_price
+            .checked_sub(maker_fee_amount)? // Subtract maker fee
+            .checked_sub(taker_fee_amount)?; // Subtract taker fee, seller gets net base tokens
+
+        // Update buy order state: reduce remaining, increase filled
+        buy_order.remaining_amount = buy_order.remaining_amount.checked_sub(trade_amount)?;
+        buy_order.filled_amount = buy_order.filled_amount.checked_add(trade_amount)?;
         if buy_order.remaining_amount.is_zero() {
-            buy_order.status = OrderStatus::Filled;
+            buy_order.status = OrderStatus::Filled; // Mark as filled if fully executed
         }
 
-        sell_order.remaining_amount -= trade_amount;
-        sell_order.filled_amount += trade_amount;
+        // Update sell order state: reduce remaining, increase filled
+        sell_order.remaining_amount = sell_order.remaining_amount.checked_sub(trade_amount)?;
+        sell_order.filled_amount = sell_order.filled_amount.checked_add(trade_amount)?;
         if sell_order.remaining_amount.is_zero() {
-            sell_order.status = OrderStatus::Filled;
+            sell_order.status = OrderStatus::Filled; // Mark as filled if fully executed
         }
 
-        // Save updated orders to storage
+        // Persist updated order states to storage
         USER_ORDERS.save(storage, (buy_order.owner.clone(), buy_order.id), buy_order)?;
         USER_ORDERS.save(
             storage,
             (sell_order.owner.clone(), sell_order.id),
             sell_order,
         )?;
+        ORDERS.save(storage, buy_order.id, buy_order)?;
+        ORDERS.save(storage, sell_order.id, sell_order)?;
 
-        ORDERS.save(storage, buy_order.id, &buy_order)?;
-        ORDERS.save(storage, sell_order.id, &sell_order)?;
+        // Prepare messages for token transfers
+        let mut messages: Vec<CosmosMsg> = vec![];
 
-        // Create response with trade event
+        // Transfer quote tokens (CW20) to the buyer from the contract
+        // - Buyer placed a buy order, paid base tokens, now gets quote tokens
+        messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: token_pair.quote_token.clone(),
+            msg: to_json_binary(&Cw20ExecuteMsg::Transfer {
+                recipient: buy_order.owner.to_string(),
+                amount: buyer_receives,
+            })?,
+            funds: vec![],
+        }));
+
+        // Transfer base tokens (native) to the seller from the contract
+        // - Seller placed a sell order, provided quote tokens, now gets base tokens minus fees
+        messages.push(CosmosMsg::Bank(BankMsg::Send {
+            to_address: sell_order.owner.to_string(),
+            amount: vec![Coin {
+                denom: token_pair.base_token.clone(),
+                amount: seller_receives,
+            }],
+        }));
+
+        // Transfer combined fees to the fee collector (in base tokens)
+        let total_fees = maker_fee_amount.checked_add(taker_fee_amount)?;
+        if !total_fees.is_zero() {
+            messages.push(CosmosMsg::Bank(BankMsg::Send {
+                to_address: config.fee_collector.to_string(),
+                amount: vec![Coin {
+                    denom: token_pair.base_token.clone(),
+                    amount: total_fees,
+                }],
+            }));
+        }
+
+        // Construct response with transfer messages and trade details
         Ok(Response::new()
+            .add_messages(messages)
             .add_attribute("event_type", "trade")
             .add_attribute("trade_id", trade_id.to_string())
             .add_attribute("pair_id", buy_order.pair_id.clone())
@@ -902,6 +955,8 @@ pub mod execute {
             .add_attribute("total", total_price.to_string())
             .add_attribute("maker_fee", maker_fee_amount.to_string())
             .add_attribute("taker_fee", taker_fee_amount.to_string())
+            .add_attribute("buyer_receives", buyer_receives.to_string())
+            .add_attribute("seller_receives", seller_receives.to_string())
             .add_attribute("base_token", token_pair.base_token.clone())
             .add_attribute("quote_token", token_pair.quote_token.clone())
             .add_attribute("timestamp", env.block.time.seconds().to_string()))
@@ -1013,16 +1068,15 @@ pub mod execute {
 
                 if !match_amount.is_zero() {
                     // Determine buyer and seller based on order type
+                    let owner_clone = order.owner.clone();
                     let (buyer, seller, buy_order_id, sell_order_id) = match order_type {
                         OrderType::Buy => {
                             (order.owner.clone(), &info.sender, order.id, next_trade_id)
                         }
-                        OrderType::Sell => (
-                            info.sender.clone(),
-                            &order.owner.clone(),
-                            next_trade_id,
-                            order.id,
-                        ),
+                        OrderType::Sell => {
+                            // Bind the clone to a variable
+                            (info.sender.clone(), &owner_clone, next_trade_id, order.id)
+                        }
                     };
 
                     // Execute the trade
@@ -1371,7 +1425,7 @@ pub mod execute {
 
         let price_uint = Uint128::new(
             (avg_price * Decimal::from_ratio(10_u128.pow(token_info.decimals as u32), 1u128))
-                .to_uint_floor()
+                .to_uint_ceil()
                 .try_into()
                 .map_err(|_| StdError::generic_err("Price overflow"))?,
         );
@@ -1470,14 +1524,8 @@ pub mod execute {
             );
             assert_eq!(config.bonding_curve_supply, msg.bonding_curve_supply.into());
             assert_eq!(config.lp_supply, msg.lp_supply.into());
-            assert_eq!(
-                config.maker_fee,
-                msg.maker_fee,
-            );
-            assert_eq!(
-                config.taker_fee,
-                msg.taker_fee,
-            );
+            assert_eq!(config.maker_fee, msg.maker_fee,);
+            assert_eq!(config.taker_fee, msg.taker_fee,);
             assert_eq!(config.secondary_amm_address, msg.secondary_amm_address);
             assert_eq!(config.base_token_denom, msg.base_token_denom);
 
@@ -1636,7 +1684,7 @@ pub mod execute {
                 pair_id: "pair_id".to_string(),
                 token_amount: Uint128::from(100u128),
                 price: Uint128::from(10u128),
-                timestamp: env.block.time.seconds() as u64,
+                timestamp: env.block.time.seconds() as u64 + 1, // Sell order is newer for fee testing
                 status: OrderStatus::Active,
                 filled_amount: Uint128::zero(),
                 remaining_amount: Uint128::from(100u128),
@@ -1661,86 +1709,126 @@ pub mod execute {
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
                 lp_supply: 20_000_000_000u128,
-                maker_fee: Decimal::percent(1),
-                taker_fee: Decimal::percent(1),
+                maker_fee: Decimal::percent(1), // 1% maker fee
+                taker_fee: Decimal::percent(2), // 2% taker fee
                 secondary_amm_address: Addr::unchecked("secondary_amm_addr"),
                 base_token_denom: "base_token_denom".to_string(),
             };
 
-            // Execute the create_trade function
+            // Execute the create_order function
             let trade_id = 1;
             let res = create_order(
                 &mut deps.storage,
+                &env,
                 &mut buy_order,
                 &mut sell_order,
                 trade_id,
                 &token_pair,
                 &config,
-                &env,
             )
             .unwrap();
 
-            // Check the response
-            assert_eq!(res.attributes.len(), 13);
-            assert_eq!(res.attributes[0].key, "event_type");
-            assert_eq!(res.attributes[0].value, "trade");
-            assert_eq!(res.attributes[1].key, "trade_id");
-            assert_eq!(res.attributes[1].value, trade_id.to_string());
-            assert_eq!(res.attributes[2].key, "pair_id");
-            assert_eq!(res.attributes[2].value, buy_order.pair_id.clone());
-            assert_eq!(res.attributes[3].key, "buy_order_id");
-            assert_eq!(res.attributes[3].value, buy_order.id.to_string());
-            assert_eq!(res.attributes[4].key, "sell_order_id");
-            assert_eq!(res.attributes[4].value, sell_order.id.to_string());
-            assert_eq!(res.attributes[5].key, "price");
-            assert_eq!(res.attributes[5].value, sell_order.price.to_string());
-            assert_eq!(res.attributes[6].key, "amount");
-            assert_eq!(res.attributes[6].value, buy_order.token_amount.to_string());
-            assert_eq!(res.attributes[7].key, "total");
+            // Calculate expected values
+            let total_price = Uint128::new(100u128) * Uint128::new(10u128); // 1000 base tokens
+            let maker_fee = (Decimal::new(total_price) * Decimal::percent(1)).to_uint_ceil(); // 10 base tokens (buy order is maker)
+            let taker_fee = (Decimal::new(total_price) * Decimal::percent(2)).to_uint_ceil(); // 20 base tokens (sell order is taker)
+            let seller_receives = total_price - maker_fee - taker_fee; // 970 base tokens
+
+            // Check response messages (token transfers)
+            assert_eq!(res.messages.len(), 3); // 3 messages: buyer quote, seller base, fees
+
+            // Message 1: Quote tokens to buyer (100 quote tokens)
+            match &res.messages[0].msg {
+                CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr,
+                    msg,
+                    funds,
+                }) => {
+                    assert_eq!(contract_addr, "quote_token");
+                    let cw20_msg: Cw20ExecuteMsg = from_json(msg).unwrap();
+                    assert_eq!(
+                        cw20_msg,
+                        Cw20ExecuteMsg::Transfer {
+                            recipient: "buyer".to_string(),
+                            amount: Uint128::new(100u128),
+                        }
+                    );
+                    assert!(funds.is_empty());
+                }
+                _ => panic!("Unexpected message type for quote token transfer"),
+            }
+
+            // Message 2: Base tokens to seller (970 base tokens after fees)
+            match &res.messages[1].msg {
+                CosmosMsg::Bank(BankMsg::Send { to_address, amount }) => {
+                    assert_eq!(to_address, "seller");
+                    assert_eq!(amount.len(), 1);
+                    assert_eq!(
+                        amount[0],
+                        Coin {
+                            denom: "base_token".to_string(),
+                            amount: seller_receives
+                        }
+                    );
+                }
+                _ => panic!("Unexpected message type for base token transfer"),
+            }
+
+            // Message 3: Fees to fee collector (30 base tokens)
+            match &res.messages[2].msg {
+                CosmosMsg::Bank(BankMsg::Send { to_address, amount }) => {
+                    assert_eq!(to_address, "fee_collector_addr");
+                    assert_eq!(amount.len(), 1);
+                    assert_eq!(
+                        amount[0],
+                        Coin {
+                            denom: "base_token".to_string(),
+                            amount: maker_fee + taker_fee
+                        }
+                    );
+                }
+                _ => panic!("Unexpected message type for fee transfer"),
+            }
+
+            // Check response attributes (updated due to new fields)
+            assert_eq!(res.attributes.len(), 15); // Updated to 15 with buyer_receives and seller_receives
+            assert_eq!(res.attributes[0], attr("event_type", "trade"));
+            assert_eq!(res.attributes[1], attr("trade_id", trade_id.to_string()));
+            assert_eq!(res.attributes[2], attr("pair_id", "pair_id"));
+            assert_eq!(res.attributes[3], attr("buy_order_id", "1"));
+            assert_eq!(res.attributes[4], attr("sell_order_id", "2"));
+            assert_eq!(res.attributes[5], attr("price", "10"));
+            assert_eq!(res.attributes[6], attr("amount", "100"));
+            assert_eq!(res.attributes[7], attr("total", total_price.to_string()));
+            assert_eq!(res.attributes[8], attr("maker_fee", maker_fee.to_string()));
+            assert_eq!(res.attributes[9], attr("taker_fee", taker_fee.to_string()));
+            assert_eq!(res.attributes[10], attr("buyer_receives", "100")); // New attribute
             assert_eq!(
-                res.attributes[7].value,
-                (buy_order.token_amount * sell_order.price).to_string()
-            );
-            assert_eq!(res.attributes[8].key, "maker_fee");
+                res.attributes[11],
+                attr("seller_receives", seller_receives.to_string())
+            ); // New attribute
+            assert_eq!(res.attributes[12], attr("base_token", "base_token"));
+            assert_eq!(res.attributes[13], attr("quote_token", "quote_token"));
             assert_eq!(
-                res.attributes[8].value,
-                ((buy_order.token_amount * sell_order.price * config.maker_fee.to_uint_ceil())
-                    / Uint128::from(10000u64))
-                .to_string()
-            );
-            assert_eq!(res.attributes[9].key, "taker_fee");
-            assert_eq!(
-                res.attributes[9].value,
-                ((buy_order.token_amount * sell_order.price * config.taker_fee.to_uint_ceil())
-                    / Uint128::from(10000u64))
-                .to_string()
-            );
-            assert_eq!(res.attributes[10].key, "base_token");
-            assert_eq!(res.attributes[10].value, token_pair.base_token.clone());
-            assert_eq!(res.attributes[11].key, "quote_token");
-            assert_eq!(res.attributes[11].value, token_pair.quote_token.clone());
-            assert_eq!(res.attributes[12].key, "timestamp");
-            assert_eq!(
-                res.attributes[12].value,
-                env.block.time.seconds().to_string()
+                res.attributes[14],
+                attr("timestamp", env.block.time.seconds().to_string())
             );
 
             // Check updated order amounts
-            assert_eq!(buy_order.filled_amount, buy_order.token_amount);
+            assert_eq!(buy_order.filled_amount, Uint128::new(100u128));
             assert_eq!(buy_order.remaining_amount, Uint128::zero());
             assert_eq!(buy_order.status, OrderStatus::Filled);
-            assert_eq!(sell_order.filled_amount, sell_order.token_amount);
+            assert_eq!(sell_order.filled_amount, Uint128::new(100u128));
             assert_eq!(sell_order.remaining_amount, Uint128::zero());
             assert_eq!(sell_order.status, OrderStatus::Filled);
 
             // Verify orders were saved correctly in storage
             let saved_buy_order = USER_ORDERS
-                .load(&deps.storage, (buy_order.owner.clone(), buy_order.id))
+                .load(&deps.storage, (Addr::unchecked("buyer"), 1))
                 .unwrap();
             assert_eq!(saved_buy_order, buy_order);
-
             let saved_sell_order = USER_ORDERS
-                .load(&deps.storage, (sell_order.owner.clone(), sell_order.id))
+                .load(&deps.storage, (Addr::unchecked("seller"), 2))
                 .unwrap();
             assert_eq!(saved_sell_order, sell_order);
         }
@@ -2321,8 +2409,8 @@ pub mod execute {
                 quote_token_total_supply: 100_000_000_000u128,
                 bonding_curve_supply: 80_000_000_000u128,
                 lp_supply: 20_000_000_000u128,
-                maker_fee: Decimal::percent(1),
-                taker_fee: Decimal::percent(1),
+                maker_fee: Decimal::percent(1), // 1% maker fee
+                taker_fee: Decimal::percent(2), // 2% taker fee
                 secondary_amm_address: Addr::unchecked("secondary_amm_addr"),
                 base_token_denom: "ubase_token_denom".to_string(),
             };
@@ -2353,7 +2441,7 @@ pub mod execute {
                 pair_id: "pair_id".to_string(),
                 token_amount: Uint128::from(100u128),
                 price: Uint128::from(10u128),
-                timestamp: env.block.time.seconds() as u64,
+                timestamp: env.block.time.seconds() as u64 + 1, // Sell order is newer
                 status: OrderStatus::Active,
                 filled_amount: Uint128::zero(),
                 remaining_amount: Uint128::from(100u128),
@@ -2382,16 +2470,77 @@ pub mod execute {
             ORDER_BOOKS
                 .save(deps.as_mut().storage, "pair_id".to_string(), &order_book)
                 .unwrap();
-
             NEXT_TRADE_ID.save(deps.as_mut().storage, &0u64).unwrap();
 
-            // Execute the match_orders function
+            // Execute the match_orders function (testing buy-initiated match)
             let res = match_orders(deps.as_mut(), &env, "pair_id".to_string(), true).unwrap();
 
+            // Calculate expected values
+            let total_price = Uint128::new(100u128) * Uint128::new(10u128); // 1000 base tokens
+            let maker_fee = (Decimal::new(total_price) * Decimal::percent(1)).to_uint_ceil(); // 10 base tokens
+            let taker_fee = (Decimal::new(total_price) * Decimal::percent(2)).to_uint_ceil(); // 20 base tokens
+            let seller_receives = total_price - maker_fee - taker_fee; // 970 base tokens
+
+            // Verify response messages (3 messages expected from create_order)
+            assert_eq!(res.messages.len(), 3);
+
+            // Message 1: Quote tokens to buyer
+            match &res.messages[0].msg {
+                CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr,
+                    msg,
+                    funds,
+                }) => {
+                    assert_eq!(contract_addr, "quote_token");
+                    let cw20_msg: Cw20ExecuteMsg = from_json(msg).unwrap();
+                    assert_eq!(
+                        cw20_msg,
+                        Cw20ExecuteMsg::Transfer {
+                            recipient: "buyer".to_string(),
+                            amount: Uint128::new(100u128),
+                        }
+                    );
+                    assert!(funds.is_empty());
+                }
+                _ => panic!("Unexpected message type for quote token transfer"),
+            }
+
+            // Message 2: Base tokens to seller
+            match &res.messages[1].msg {
+                CosmosMsg::Bank(BankMsg::Send { to_address, amount }) => {
+                    assert_eq!(to_address, "seller");
+                    assert_eq!(amount.len(), 1);
+                    assert_eq!(
+                        amount[0],
+                        Coin {
+                            denom: "base_token".to_string(),
+                            amount: seller_receives
+                        }
+                    );
+                }
+                _ => panic!("Unexpected message type for base token transfer"),
+            }
+
+            // Message 3: Fees to fee collector
+            match &res.messages[2].msg {
+                CosmosMsg::Bank(BankMsg::Send { to_address, amount }) => {
+                    assert_eq!(to_address, "fee_collector_addr");
+                    assert_eq!(amount.len(), 1);
+                    assert_eq!(
+                        amount[0],
+                        Coin {
+                            denom: "base_token".to_string(),
+                            amount: maker_fee + taker_fee
+                        }
+                    );
+                }
+                _ => panic!("Unexpected message type for fee transfer"),
+            }
+
             // Verify response attributes
-            assert_eq!(res.attributes.len(), 13);
-            assert_eq!(res.attributes[0].key, "event_type");
-            assert_eq!(res.attributes[0].value, "trade");
+            assert_eq!(res.attributes.len(), 15); // Updated to 15 with new fields
+            assert_eq!(res.attributes[0], attr("event_type", "trade"));
+            assert_eq!(res.attributes[1], attr("trade_id", "0")); // First trade ID
 
             // Verify that orders have been matched and updated in storage
             let saved_buy_order = USER_ORDERS
@@ -2410,10 +2559,13 @@ pub mod execute {
 
             // Order book should be emptied
             let order_book = ORDER_BOOKS
-                .load(&mut deps.storage, "pair_id".to_string())
+                .load(&deps.storage, "pair_id".to_string())
                 .unwrap();
             assert!(order_book.buy_orders.is_empty());
             assert!(order_book.sell_orders.is_empty());
+
+            // Verify NEXT_TRADE_ID incremented
+            assert_eq!(NEXT_TRADE_ID.load(&deps.storage).unwrap(), 1u64);
         }
 
         #[test]
@@ -3438,7 +3590,7 @@ pub mod execute {
 
             let expected_price = Uint128::new(
                 (avg_price * Decimal::from_ratio(10_u128.pow(token_info.decimals as u32), 1u128))
-                    .to_uint_floor()
+                    .to_uint_ceil()
                     .into(),
             );
 
@@ -3538,7 +3690,7 @@ pub mod execute {
 
             let expected_price = Uint128::new(
                 (avg_price * Decimal::from_ratio(10_u128.pow(token_info.decimals as u32), 1u128))
-                    .to_uint_floor()
+                    .to_uint_ceil()
                     .into(),
             );
 

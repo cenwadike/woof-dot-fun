@@ -18,8 +18,8 @@ The project consists of the following components:
 3. Clone the repository.
 
 ```sh
-    git clone https://github.com/your-repo/token-factory.git
-    cd token-factory
+    git clone https://github.com/cenwadike/woof-dot-fun.git
+    cd woof-dot-fun
 ```
 
 ## Contributing
