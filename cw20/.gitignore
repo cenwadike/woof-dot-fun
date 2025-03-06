@@ -14,5 +14,6 @@
 # IDEs
 *.iml
 .idea
+.env
 
 /artifacts

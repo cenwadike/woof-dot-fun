@@ -1,0 +1,18 @@
+{
+  "name": "token-factory",
+  "version": "1.0.0",
+  "description": "The Token Factory Smart Contract allows you to create, manage, and query custom tokens on the blockchain. It's designed for ease of use and extensibility.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@cosmjs/cosmwasm-stargate": "^0.33.0",
+    "@cosmjs/proto-signing": "^0.33.0",
+    "@cosmjs/stargate": "^0.33.0",
+    "dotenv": "^16.4.7"
+  }
+}

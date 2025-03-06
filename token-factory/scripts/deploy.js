@@ -9,7 +9,7 @@ dotenv.config()
 
 const rpcEndpoint = "https://rpc-palvus.pion-1.ntrn.tech";
 const mnemonic = process.env.MNEMONIC;
-const wasmFilePath = "./artifacts/first_token_cw20contract.wasm";
+const wasmFilePath = "../artifacts/token_factory.wasm";
 
 async function main() {
   const wallet = await DirectSecp256k1HdWallet.fromMnemonic(mnemonic, {
@@ -31,25 +31,20 @@ async function main() {
   console.log("Upload successful, code ID:", uploadReceipt.codeId);
 
   const initMsg = {
-    name: "Test ATOM",
-    symbol: "tATOM",
-    decimals: 6,
-    initial_balances: [
-      {
-        "address": "neutron107nhk9pqhp446fr0fc83z0v82rg9guy8runkuz",
-        "amount": "10000000"
-      },
-      {
-        "address": "neutron1tn5uf2q6n5ks8a40vkf2j2tkz0c9asd0udq6t4",
-        "amount": "10000000"
-      }
-    ]
+    token_code_id: 11031,
+    token_code_hash: "5fee983db91565497b13238c30935d39ff15bd7fe12bb6c4946a5d18b41fa58e"
   };
 
-  const instantiateReceipt = await client.instantiate(firstAccount.address, uploadReceipt.codeId, initMsg, "CW Token", "auto");
+  const instantiateReceipt = await client.instantiate(
+    firstAccount.address, 
+    uploadReceipt.codeId, 
+    initMsg, 
+    "Woof.fun Test", 
+    "auto"
+  );
   console.log("Contract instantiated at:", instantiateReceipt.contractAddress);
+    // Upload successful, code ID: 11032
+    // Contract instantiated at: neutron15e8pmchvjyx3uecc9zqt82c90vxghgxcu6chexwuwggp4yh5tdkq36mc5w
 }
 
 main().catch(console.error);
-
-

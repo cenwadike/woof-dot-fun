@@ -174,7 +174,7 @@ pub mod execute {
         )?;
         TOKEN_INFO.save(
             deps.storage,
-            deps.api.addr_humanize(&address).unwrap().as_str(),
+            human_address.as_str(),
             &token_info,
         )?;
         state.token_count = token_count;
