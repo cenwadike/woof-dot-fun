@@ -1,11 +1,12 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
-use cosmwasm_std::Addr;
+use cosmwasm_std::{Addr, HexBinary};
 
 use crate::state::{Cw20Coin, TokenInfo};
 
 #[cw_serde]
 pub struct InstantiateMsg {
     pub token_code_id: u64,
+    pub token_code_hash: HexBinary,
 }
 
 #[cw_serde]
@@ -14,6 +15,7 @@ pub enum ExecuteMsg {
         name: String,
         symbol: String,
         decimals: u8,
+        uri: String,
         initial_balances: Vec<Cw20Coin>,
     },
     TransferOwnership {
@@ -21,6 +23,7 @@ pub enum ExecuteMsg {
     },
     UpdateTokenCodeId {
         new_token_code_id: u64,
+        new_token_code_hash: HexBinary,
     },
 }
 

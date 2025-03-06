@@ -24,6 +24,7 @@ pub enum ExecuteMsg {
         name: String,
         symbol: String,
         decimals: u8,
+        uri: String,
         max_price_impact: Uint128,
         curve_slope: Uint128,
     },

@@ -12,7 +12,6 @@ use query::{
     query_list_tokens, query_owner, query_token_address, query_token_count, query_token_info,
     query_tokens_by_creator,
 };
-use sha2::{Digest, Sha256};
 
 use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
@@ -35,6 +34,7 @@ pub fn instantiate(
         owner: info.sender.clone(),
         token_count: 0u32,
         token_code_id: msg.token_code_id,
+        token_code_hash: msg.token_code_hash,
         token_creation_reply_id: 1u64,
     };
 
@@ -58,6 +58,7 @@ pub fn execute(
             name,
             symbol,
             decimals,
+            uri,
             initial_balances,
         } => Ok(execute_create_token(
             deps,
@@ -66,14 +67,21 @@ pub fn execute(
             name,
             symbol,
             decimals,
+            uri,
             initial_balances,
         )?),
         ExecuteMsg::TransferOwnership { new_owner } => {
             Ok(execute_transfer_ownership(deps, info, new_owner)?)
         }
-        ExecuteMsg::UpdateTokenCodeId { new_token_code_id } => {
-            Ok(execute_update_token_code_id(deps, info, new_token_code_id)?)
-        }
+        ExecuteMsg::UpdateTokenCodeId {
+            new_token_code_id,
+            new_token_code_hash,
+        } => Ok(execute_update_token_code_id(
+            deps,
+            info,
+            new_token_code_id,
+            new_token_code_hash,
+        )?),
     }
 }
 
@@ -93,9 +101,8 @@ pub fn reply(deps: DepsMut, _env: Env, msg: Reply) -> StdResult<Response> {
 }
 
 pub mod execute {
-    use cosmwasm_std::{Addr, SubMsg, Uint128, WasmMsg};
-
-    use crate::state::{Cw20Coin, TokenInfo, TOKEN_INFO};
+    use cosmwasm_std::{instantiate2_address, Addr, HexBinary, SubMsg, Uint128, WasmMsg};
+    use crate::state::{Cw20Coin, TokenInfo, TOKEN_ADDRESS, TOKEN_INFO};
 
     use super::*;
 
@@ -106,13 +113,24 @@ pub mod execute {
         name: String,
         symbol: String,
         decimals: u8,
+        uri: String,
         initial_balances: Vec<Cw20Coin>,
     ) -> StdResult<Response> {
         let mut state = STATE.load(deps.storage)?;
 
-        // Generate deterministic address using enhanced algorithm
+        // Validate addresses
+        let sender = deps.api.addr_validate(info.sender.as_str())?;
+        for coin in &initial_balances {
+            deps.api.addr_validate(&coin.address)?;
+        }
+
+        // Generate deterministic address using instantiate2 algorithm
         let token_count = state.token_count + 1;
-        let address = generate_token_address(&name, &symbol);
+        let creator_canon = deps.api.addr_canonicalize(sender.as_str())?;
+        let salt = Binary::new(format!("woof_token_{}", token_count).into_bytes());
+
+        let address = instantiate2_address(&state.token_code_hash, &creator_canon, &salt).unwrap();
+        let human_address = deps.api.addr_humanize(&address)?;
 
         // Calculate total supply
         let total_supply = initial_balances
@@ -142,23 +160,34 @@ pub mod execute {
             name: name.clone(),
             symbol: symbol.clone(),
             decimals: decimals.clone(),
+            uri: uri.clone(),
             creator: info.sender.clone(),
-            address: address.clone(),
+            address: deps.api.addr_humanize(&address).unwrap(),
             creation_time: env.block.time.seconds(),
             total_supply,
         };
 
-        TOKEN_INFO.save(deps.storage, address.as_str(), &token_info)?;
+        TOKEN_ADDRESS.save(
+            deps.storage,
+            (&name, &symbol),
+            &human_address,
+        )?;
+        TOKEN_INFO.save(
+            deps.storage,
+            deps.api.addr_humanize(&address).unwrap().as_str(),
+            &token_info,
+        )?;
         state.token_count = token_count;
         STATE.save(deps.storage, &state)?;
 
         // Create instantiate message
-        let instantiate = WasmMsg::Instantiate {
-            admin: Some(info.sender.to_string()),
+        let instantiate = WasmMsg::Instantiate2 {
+            admin: Some(sender.to_string()),
             code_id: state.token_code_id,
+            label: format!("woof_token_{}", token_count),
             msg: to_json_binary(&instantiate_msg)?,
             funds: vec![],
-            label: format!("woof_token_{}", token_count),
+            salt,
         };
 
         Ok(Response::new()
@@ -171,7 +200,8 @@ pub mod execute {
                 ("name", &name),
                 ("symbol", &symbol),
                 ("decimals", &decimals.to_string()),
-                ("address", address.as_str()),
+                ("uri", &uri),
+                ("address", human_address.as_str()),
                 ("creator", info.sender.as_str()),
             ]))
     }
@@ -201,6 +231,7 @@ pub mod execute {
         deps: DepsMut,
         info: MessageInfo,
         new_token_code_id: u64,
+        new_token_code_hash: HexBinary,
     ) -> StdResult<Response> {
         let state = STATE.load(deps.storage)?;
         let owner = state.owner.clone();
@@ -214,6 +245,7 @@ pub mod execute {
                 owner: state.owner,
                 token_count: state.token_count,
                 token_code_id: new_token_code_id,
+                token_code_hash: new_token_code_hash,
                 token_creation_reply_id: state.token_creation_reply_id,
             },
         )?;
@@ -227,22 +259,6 @@ pub mod execute {
     pub fn handle_token_creation_reply(_deps: DepsMut, msg: Reply) -> StdResult<Response> {
         let res = cw_utils::parse_instantiate_response_data(&msg.payload).unwrap();
         Ok(Response::new().add_attribute("token_address", res.contract_address))
-    }
-
-    // Enhanced address generation algorithm
-    pub fn generate_token_address(name: &str, symbol: &str) -> Addr {
-        let mut hasher = Sha256::new();
-
-        // Combine multiple factors for better uniqueness
-        let input = format!("{}:{}", name, symbol,);
-
-        hasher.update(input.as_bytes());
-        let result = hasher.finalize();
-
-        // Create address with woof prefix
-        let address = format!("woof1{}", hex::encode(&result[..20]));
-
-        Addr::unchecked(address)
     }
 }
 
@@ -270,19 +286,19 @@ pub mod query {
             GetListTokensResponse, GetOwnerResponse, GetTokenAddressResponse,
             GetTokenCountResponse, GetTokenInfoResponse, GetTokensByCreatorResponse,
         },
-        state::{TokenInfo, DEFAULT_LIMIT, MAX_LIMIT, TOKEN_INFO},
+        state::{TokenInfo, DEFAULT_LIMIT, MAX_LIMIT, TOKEN_ADDRESS, TOKEN_INFO},
     };
     use cosmwasm_std::{Addr, Order};
     use cw_storage_plus::Bound;
 
-    use super::{execute::generate_token_address, *};
+    use super::*;
 
     pub fn query_token_address(
-        _deps: Deps,
+        deps: Deps,
         name: String,
         symbol: String,
     ) -> StdResult<GetTokenAddressResponse> {
-        let address = generate_token_address(&name, &symbol);
+        let address = TOKEN_ADDRESS.load(deps.storage, (&name, &symbol))?;
 
         Ok(GetTokenAddressResponse {
             address: Addr::unchecked(address),
@@ -354,19 +370,22 @@ pub mod query {
 
 #[cfg(test)]
 mod tests {
-    use crate::contract::execute::generate_token_address;
-    use crate::state::{ContractAddress, Cw20Coin, TokenInfo, TOKEN_INFO};
-
     use super::*;
+    use crate::state::{ContractAddress, Cw20Coin, TokenInfo, TOKEN_INFO};
     use cosmwasm_std::testing::{message_info, mock_dependencies, mock_env};
-    use cosmwasm_std::{attr, Addr, Event, SubMsgResponse, SubMsgResult, Uint128};
+    use cosmwasm_std::{attr, Addr, Event, HexBinary, SubMsgResponse, SubMsgResult, Uint128};
+    use cw_multi_test::App;
+    use cw_multi_test::ContractWrapper;
     use prost::Message;
 
     #[test]
     fn test_instantiate() {
         let mut deps = mock_dependencies();
 
-        let msg = InstantiateMsg { token_code_id: 10 };
+        let msg = InstantiateMsg {
+            token_code_id: 10,
+            token_code_hash: HexBinary::default(),
+        };
         let info = message_info(&Addr::unchecked("creator"), &[]);
         let env = mock_env();
 
@@ -387,6 +406,7 @@ mod tests {
                 owner: info.sender,
                 token_count: 0,
                 token_code_id: 10,
+                token_code_hash: HexBinary::default(),
                 token_creation_reply_id: 1,
             }
         );
@@ -396,9 +416,22 @@ mod tests {
     fn test_execute_create_token() {
         let mut deps = mock_dependencies();
 
+        let mut app = App::default();
+
+        let creator = app.api().addr_make("creator");
+
+        let code = ContractWrapper::new(execute, instantiate, query);
+        let code_id = app.store_code(Box::new(code));
+
         // Instantiate the contract
-        let instantiate_msg = InstantiateMsg { token_code_id: 10 };
-        let info = message_info(&Addr::unchecked("creator"), &[]);
+        let instantiate_msg = InstantiateMsg {
+            token_code_id: code_id,
+            token_code_hash: HexBinary::from_hex(
+                &"528E5F16D05CDE640CDEF6D779A458CBF566AA4820E40ACFCF5066978D388CAD",
+            )
+            .unwrap(),
+        };
+        let info = message_info(&Addr::unchecked(creator), &[]);
         let env = mock_env();
         instantiate(deps.as_mut(), env.clone(), info.clone(), instantiate_msg).unwrap();
 
@@ -407,16 +440,11 @@ mod tests {
             name: "Token".to_string(),
             symbol: "TKN".to_string(),
             decimals: 9,
-            initial_balances: vec![
-                Cw20Coin {
-                    address: "addr0000".to_string(),
-                    amount: Uint128::new(1000 * 10_i32.pow(9) as u128),
-                },
-                Cw20Coin {
-                    address: "addr0001".to_string(),
-                    amount: Uint128::new(2000 * 10_i32.pow(9) as u128),
-                },
-            ],
+            uri: "URL".to_string(),
+            initial_balances: vec![Cw20Coin {
+                address: env.contract.address.to_string(),
+                amount: Uint128::new(1000 * 10_i32.pow(9) as u128),
+            }],
         };
 
         // Execute the CreateToken message
@@ -437,6 +465,7 @@ mod tests {
                 attr("name", "Token"),
                 attr("symbol", "TKN"),
                 attr("decimals", "9"),
+                attr("uri", "URL"),
                 attr("address", token_address_event.as_str()),
                 attr("creator", info.sender.as_str()),
             ]
@@ -447,7 +476,7 @@ mod tests {
             query_token_address(deps.as_ref(), "Token".to_string(), "TKN".to_string()).unwrap();
         let token_address_query = query_res.address.to_string();
 
-        // Ensure the token address from the event matches the one queried from the blockchain
+        // // Ensure the token address from the event matches the one queried from the blockchain
         assert_eq!(token_address_event, token_address_query);
 
         // Further checks on the token info
@@ -457,9 +486,10 @@ mod tests {
         assert_eq!(token_info.name, "Token".to_string());
         assert_eq!(token_info.symbol, "TKN".to_string());
         assert_eq!(token_info.decimals, 9);
+        assert_eq!(token_info.uri, "URL".to_string());
         assert_eq!(
             token_info.total_supply,
-            Uint128::new(3000 * 10_i32.pow(9) as u128)
+            Uint128::new(1000 * 10_i32.pow(9) as u128)
         );
         assert_eq!(token_info.creator, info.sender);
     }
@@ -468,7 +498,10 @@ mod tests {
     fn test_execute_transfer_ownership() {
         let mut deps = mock_dependencies();
 
-        let instantiate_msg = InstantiateMsg { token_code_id: 10 };
+        let instantiate_msg = InstantiateMsg {
+            token_code_id: 10,
+            token_code_hash: HexBinary::default(),
+        };
         let info = message_info(&Addr::unchecked("creator"), &[]);
         let env = mock_env();
         instantiate(deps.as_mut(), env.clone(), info.clone(), instantiate_msg).unwrap();
@@ -501,13 +534,17 @@ mod tests {
     fn test_execute_update_token_code_id() {
         let mut deps = mock_dependencies();
 
-        let instantiate_msg = InstantiateMsg { token_code_id: 10 };
+        let instantiate_msg = InstantiateMsg {
+            token_code_id: 10,
+            token_code_hash: HexBinary::default(),
+        };
         let info = message_info(&Addr::unchecked("creator"), &[]);
         let env = mock_env();
         instantiate(deps.as_mut(), env.clone(), info.clone(), instantiate_msg).unwrap();
 
         let update_token_code_id_msg = ExecuteMsg::UpdateTokenCodeId {
             new_token_code_id: 20,
+            new_token_code_hash: HexBinary::default(),
         };
 
         let res = execute(
@@ -534,7 +571,10 @@ mod tests {
     fn test_reply() {
         let mut deps = mock_dependencies();
 
-        let instantiate_msg = InstantiateMsg { token_code_id: 10 };
+        let instantiate_msg = InstantiateMsg {
+            token_code_id: 10,
+            token_code_hash: HexBinary::default(),
+        };
         let info = message_info(&Addr::unchecked("creator"), &[]);
         let env = mock_env();
         instantiate(deps.as_mut(), env.clone(), info.clone(), instantiate_msg).unwrap();
@@ -567,21 +607,6 @@ mod tests {
     }
 
     #[test]
-    fn test_query_token_address() {
-        let deps = mock_dependencies();
-
-        let name = "Token".to_string();
-        let symbol = "TKN".to_string();
-
-        let response =
-            query::query_token_address(deps.as_ref(), name.clone(), symbol.clone()).unwrap();
-        assert_eq!(
-            response.address,
-            Addr::unchecked(generate_token_address(&name, &symbol))
-        );
-    }
-
-    #[test]
     fn test_query_token_info() {
         let mut deps = mock_dependencies();
         let token_address = "woof1abcd".to_string();
@@ -590,6 +615,7 @@ mod tests {
             name: "Token".to_string(),
             symbol: "TKN".to_string(),
             decimals: 9,
+            uri: "URL".to_string(),
             creator: Addr::unchecked("creator"),
             address: Addr::unchecked(token_address.clone()),
             creation_time: 1234567890,
@@ -612,6 +638,7 @@ mod tests {
             name: "Token1".to_string(),
             symbol: "TK1".to_string(),
             decimals: 8,
+            uri: "URL".to_string(),
             creator: Addr::unchecked("creator"),
             address: Addr::unchecked("woof1abcd"),
             creation_time: 1234567890,
@@ -622,6 +649,7 @@ mod tests {
             name: "Token2".to_string(),
             symbol: "TK2".to_string(),
             decimals: 8,
+            uri: "URL".to_string(),
             creator: Addr::unchecked("creator"),
             address: Addr::unchecked("woof1efgh"),
             creation_time: 1234567890,
@@ -657,6 +685,7 @@ mod tests {
             owner: Addr::unchecked("owner"),
             token_count: 2,
             token_code_id: 1,
+            token_code_hash: HexBinary::default(),
             token_creation_reply_id: 1,
         };
         STATE.save(&mut deps.storage, &state).unwrap();
@@ -672,6 +701,7 @@ mod tests {
             owner: Addr::unchecked("owner"),
             token_count: 2,
             token_code_id: 1,
+            token_code_hash: HexBinary::default(),
             token_creation_reply_id: 1,
         };
         STATE.save(&mut deps.storage, &state).unwrap();
@@ -688,6 +718,7 @@ mod tests {
             name: "Token1".to_string(),
             symbol: "TK1".to_string(),
             decimals: 9,
+            uri: "URL".to_string(),
             creator: Addr::unchecked("creator"),
             address: Addr::unchecked("woof1abcd".to_string()),
             creation_time: 1234567890,
@@ -698,16 +729,30 @@ mod tests {
             name: "Token2".to_string(),
             symbol: "TK2".to_string(),
             decimals: 9,
+            uri: "URL".to_string(),
             creator: Addr::unchecked("creator"),
             address: Addr::unchecked("woof1efgh".to_string()),
             creation_time: 1234567890,
             total_supply: Uint128::new(2000),
         };
 
-        TOKEN_INFO.save(&mut deps.storage, token_info1.address.as_str(), &token_info1).unwrap();
-        TOKEN_INFO.save(&mut deps.storage, token_info2.address.as_str(), &token_info2).unwrap();
+        TOKEN_INFO
+            .save(
+                &mut deps.storage,
+                token_info1.address.as_str(),
+                &token_info1,
+            )
+            .unwrap();
+        TOKEN_INFO
+            .save(
+                &mut deps.storage,
+                token_info2.address.as_str(),
+                &token_info2,
+            )
+            .unwrap();
 
-        let response = query::query_list_tokens(deps.as_ref(), Some("".to_string()), Some(2)).unwrap();
+        let response =
+            query::query_list_tokens(deps.as_ref(), Some("".to_string()), Some(2)).unwrap();
         assert_eq!(response.tokens.len(), 2);
         assert!(response.tokens.contains(&token_info1));
         assert!(response.tokens.contains(&token_info2));

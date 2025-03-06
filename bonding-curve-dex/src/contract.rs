@@ -111,6 +111,7 @@ pub fn execute(
             name,
             symbol,
             decimals,
+            uri,
             max_price_impact,
             curve_slope,
         } => Ok(execute_create_token(
@@ -120,6 +121,7 @@ pub fn execute(
             name,
             symbol,
             decimals,
+            uri,
             max_price_impact,
             curve_slope,
         )?),
@@ -189,10 +191,11 @@ pub mod execute {
     use std::str::FromStr;
 
     use cosmwasm_std::{
-        attr, Addr, BankMsg, Coin, CosmosMsg, Decimal, Deps, StdError, Storage, SubMsg, Uint128, WasmMsg
+        attr, Addr, BankMsg, Coin, CosmosMsg, Decimal, Deps, StdError, Storage, SubMsg, Uint128,
+        WasmMsg,
     };
     use cw20::Cw20ExecuteMsg;
-    use token_factory::{contract::execute::generate_token_address, state::Cw20Coin};
+    use token_factory::state::Cw20Coin;
 
     use crate::state::{
         Order, OrderStatus, OrderType, Pool, TokenInfo, TokenPair, Trade, BASE_PRICE,
@@ -209,6 +212,7 @@ pub mod execute {
         name: String,
         symbol: String,
         decimals: u8,
+        uri: String,
         max_price_impact: Uint128,
         curve_slope: Uint128,
     ) -> StdResult<Response> {
@@ -239,7 +243,31 @@ pub mod execute {
             .quote_token_total_supply
             .checked_mul(Uint128::from(10u128.pow(decimals as u32)).into())
             .unwrap_or(0u128);
-        let token_address = generate_token_address(&name, &symbol);
+
+        // Call token factory contract
+        let msg = WasmMsg::Execute {
+            contract_addr: config.token_factory.to_string(),
+            msg: to_json_binary(&token_factory::msg::ExecuteMsg::CreateToken {
+                name: name.clone(),
+                symbol: symbol.clone(),
+                decimals,
+                uri,
+                initial_balances: vec![Cw20Coin {
+                    address: env.contract.address.to_string(),
+                    amount: total_supply.into(),
+                }],
+            })?,
+            funds: vec![],
+        };
+
+        let token_address: token_factory::msg::GetTokenAddressResponse =
+            deps.querier.query_wasm_smart(
+                config.token_factory.to_string(),
+                &token_factory::msg::QueryMsg::GetTokenAddress {
+                    name: name.clone(),
+                    symbol: symbol.clone(),
+                },
+            )?;
 
         let token_info = TokenInfo {
             name: name.clone(),
@@ -253,7 +281,7 @@ pub mod execute {
 
         let token_pair = TokenPair {
             base_token: config.base_token_denom.clone(),
-            quote_token: token_address.clone().to_string(),
+            quote_token: token_address.clone().address.to_string(),
             base_decimals: 6,
             quote_decimals: token_info.decimals,
             enabled: true,
@@ -262,24 +290,9 @@ pub mod execute {
         // remove the "u" before the token
         let pair_id = format!("{}/{}", token_info.symbol, &config.base_token_denom[1..]);
 
-        // Call token factory contract
-        let msg = WasmMsg::Execute {
-            contract_addr: config.token_factory.to_string(),
-            msg: to_json_binary(&token_factory::msg::ExecuteMsg::CreateToken {
-                name: name.clone(),
-                symbol: symbol.clone(),
-                decimals,
-                initial_balances: vec![Cw20Coin {
-                    address: env.contract.address.to_string(),
-                    amount: total_supply.into(),
-                }],
-            })?,
-            funds: vec![],
-        };
-
         // Initialize pool
         let pool = Pool {
-            token_address: token_address.clone(),
+            token_address: token_address.clone().address,
             total_reserve_token: Uint128::zero(),
             token_sold: Uint128::zero(),
             total_volume: Uint128::zero(),
@@ -291,9 +304,9 @@ pub mod execute {
             enabled: true,
         };
 
-        TOKEN_INFO.save(deps.storage, token_address.to_string(), &token_info)?;
+        TOKEN_INFO.save(deps.storage, token_address.address.to_string(), &token_info)?;
         TOKEN_PAIRS.save(deps.storage, pair_id, &token_pair)?;
-        POOLS.save(deps.storage, token_address.to_string(), &pool)?;
+        POOLS.save(deps.storage, token_address.address.to_string(), &pool)?;
 
         Ok(Response::new()
             .add_message(msg)
@@ -651,10 +664,10 @@ pub mod execute {
         let config = CONFIG.load(deps.storage)?;
         let token_pair = TOKEN_PAIRS.load(deps.storage, pair_id.clone())?;
         let mut next_trade_id = NEXT_TRADE_ID.load(deps.storage)?;
-    
+
         let mut response = Response::new();
         let mut messages: Vec<SubMsg> = vec![];
-    
+
         if is_buy {
             for (buy_price, buy_orders) in order_book.buy_orders.iter_mut().rev() {
                 for buy_order in buy_orders.iter_mut() {
@@ -716,11 +729,11 @@ pub mod execute {
                 }
             }
         }
-    
+
         clean_up_order_book(&mut order_book);
         ORDER_BOOKS.save(deps.storage, pair_id, &order_book)?;
         NEXT_TRADE_ID.save(deps.storage, &next_trade_id)?;
-    
+
         Ok(response.add_submessages(messages))
     }
 
@@ -1454,7 +1467,6 @@ pub mod execute {
         };
         use cosmwasm_std::{ContractResult, StdError, SystemResult, WasmQuery};
         use cw20::{AllowanceResponse, BalanceResponse, Cw20ExecuteMsg, Expiration};
-        use token_factory::contract::execute::generate_token_address;
         use token_factory::state::Cw20Coin;
 
         #[test]
@@ -1564,17 +1576,31 @@ pub mod execute {
             let name = "Test Token".to_string();
             let symbol = "TST".to_string();
             let decimals = 8;
+            let uri = "URL".to_string();
             let max_price_impact = Uint128::from(100u128);
             let curve_slope = Uint128::from(1u128);
+
+            let token_address = Addr::unchecked("mock_token_address");
+            // Mock the token factory query response
+            deps.querier.update_wasm(move |_| {
+                let token_address = Addr::unchecked("mock_token_address");
+                SystemResult::Ok(ContractResult::Ok(
+                    to_json_binary(&token_factory::msg::GetTokenAddressResponse {
+                        address: token_address.clone(),
+                    })
+                    .unwrap(),
+                ))
+            });
 
             // Execute the create_token function
             let res = execute_create_token(
                 deps.as_mut(),
-                mock_env(),
+                env.clone(),
                 info.clone(),
                 name.clone(),
                 symbol.clone(),
                 decimals,
+                uri.clone(),
                 max_price_impact,
                 curve_slope,
             )
@@ -1605,6 +1631,7 @@ pub mod execute {
                         name: name.clone(),
                         symbol: symbol.clone(),
                         decimals,
+                        uri,
                         initial_balances: vec![Cw20Coin {
                             address: env.contract.address.to_string(),
                             amount: Uint128::from(
@@ -1618,10 +1645,10 @@ pub mod execute {
             );
 
             // Verify that the token information was saved correctly
-            let token_address = generate_token_address(&name, &symbol);
             let token_info = TOKEN_INFO
                 .load(&deps.storage, token_address.to_string())
                 .unwrap();
+
             assert_eq!(token_info.name, name);
             assert_eq!(token_info.symbol, symbol);
             assert_eq!(token_info.decimals, decimals);
