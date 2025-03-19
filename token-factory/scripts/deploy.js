@@ -43,8 +43,8 @@ async function main() {
     "auto"
   );
   console.log("Contract instantiated at:", instantiateReceipt.contractAddress);
-    // Upload successful, code ID: 11032
-    // Contract instantiated at: neutron15e8pmchvjyx3uecc9zqt82c90vxghgxcu6chexwuwggp4yh5tdkq36mc5w
+  // Upload successful, code ID: 11152
+  // Contract instantiated at: neutron1f3224jexv9qwnvaa3xm772nfnqqrwkualph8cc05h0559yfjmfjqcsgxfd
 }
 
 main().catch(console.error);

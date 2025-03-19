@@ -9,8 +9,7 @@ use execute::{
     handle_token_creation_reply,
 };
 use query::{
-    query_list_tokens, query_owner, query_token_address, query_token_count, query_token_info,
-    query_tokens_by_creator,
+    query_config, query_list_tokens, query_owner, query_token_address, query_token_count, query_token_info, query_tokens_by_creator
 };
 
 use crate::error::ContractError;
@@ -59,6 +58,8 @@ pub fn execute(
             symbol,
             decimals,
             uri,
+            max_price_impact,
+            curve_slope,
             initial_balances,
         } => Ok(execute_create_token(
             deps,
@@ -68,6 +69,8 @@ pub fn execute(
             symbol,
             decimals,
             uri,
+            max_price_impact,
+            curve_slope,
             initial_balances,
         )?),
         ExecuteMsg::TransferOwnership { new_owner } => {
@@ -101,8 +104,8 @@ pub fn reply(deps: DepsMut, _env: Env, msg: Reply) -> StdResult<Response> {
 }
 
 pub mod execute {
+    use crate::state::{Cw20Coin, TokenCreationResponse, TokenInfo, TOKEN_ADDRESS, TOKEN_INFO};
     use cosmwasm_std::{instantiate2_address, Addr, HexBinary, SubMsg, Uint128, WasmMsg};
-    use crate::state::{Cw20Coin, TokenInfo, TOKEN_ADDRESS, TOKEN_INFO};
 
     use super::*;
 
@@ -114,32 +117,49 @@ pub mod execute {
         symbol: String,
         decimals: u8,
         uri: String,
+        max_price_impact: Uint128, 
+        curve_slope: Uint128,      
         initial_balances: Vec<Cw20Coin>,
     ) -> StdResult<Response> {
         let mut state = STATE.load(deps.storage)?;
-
-        // Validate addresses
+    
+        let is_unique = TOKEN_ADDRESS.has(deps.storage, (&name, &symbol));
+        if !is_unique {
+            return Err(StdError::generic_err("Token name and symbol pair must be unique"));
+        }
+    
         let sender = deps.api.addr_validate(info.sender.as_str())?;
         for coin in &initial_balances {
             deps.api.addr_validate(&coin.address)?;
         }
-
-        // Generate deterministic address using instantiate2 algorithm
+    
         let token_count = state.token_count + 1;
         let creator_canon = deps.api.addr_canonicalize(sender.as_str())?;
         let salt = Binary::new(format!("woof_token_{}", token_count).into_bytes());
-
+    
         let address = instantiate2_address(&state.token_code_hash, &creator_canon, &salt).unwrap();
         let human_address = deps.api.addr_humanize(&address)?;
-
-        // Calculate total supply
+    
         let total_supply = initial_balances
             .iter()
-            .try_fold(Uint128::zero(), |acc, coin| {
-                acc.checked_add(Uint128::from(coin.amount))
-            })?;
-
-        // Prepare CW20 instantiate message
+            .try_fold(Uint128::zero(), |acc, coin| acc.checked_add(coin.amount))?;
+    
+        let token_info = TokenInfo {
+            name: name.clone(),
+            symbol: symbol.clone(),
+            decimals,
+            uri: uri.clone(),
+            creator: sender.clone(),
+            address: human_address.clone(),
+            creation_time: env.block.time.seconds(),
+            total_supply,
+        };
+    
+        TOKEN_ADDRESS.save(deps.storage, (&name, &symbol), &human_address)?;
+        TOKEN_INFO.save(deps.storage, &human_address.as_str(), &token_info)?;
+        state.token_count = token_count;
+        STATE.save(deps.storage, &state)?;
+    
         let instantiate_msg = cw20_base::msg::InstantiateMsg {
             name: name.clone(),
             symbol: symbol.clone(),
@@ -148,39 +168,13 @@ pub mod execute {
                 .into_iter()
                 .map(|coin| cw20::Cw20Coin {
                     address: coin.address,
-                    amount: coin.amount.into(),
+                    amount: coin.amount,
                 })
                 .collect(),
             mint: None,
             marketing: None,
         };
-
-        // Save token info
-        let token_info = TokenInfo {
-            name: name.clone(),
-            symbol: symbol.clone(),
-            decimals: decimals.clone(),
-            uri: uri.clone(),
-            creator: info.sender.clone(),
-            address: deps.api.addr_humanize(&address).unwrap(),
-            creation_time: env.block.time.seconds(),
-            total_supply,
-        };
-
-        TOKEN_ADDRESS.save(
-            deps.storage,
-            (&name, &symbol),
-            &human_address,
-        )?;
-        TOKEN_INFO.save(
-            deps.storage,
-            human_address.as_str(),
-            &token_info,
-        )?;
-        state.token_count = token_count;
-        STATE.save(deps.storage, &state)?;
-
-        // Create instantiate message
+    
         let instantiate = WasmMsg::Instantiate2 {
             admin: Some(sender.to_string()),
             code_id: state.token_code_id,
@@ -189,12 +183,9 @@ pub mod execute {
             funds: vec![],
             salt,
         };
-
+    
         Ok(Response::new()
-            .add_submessage(SubMsg::reply_on_success(
-                instantiate,
-                state.token_creation_reply_id,
-            ))
+            .add_submessage(SubMsg::reply_on_success(instantiate, state.token_creation_reply_id))
             .add_attributes(vec![
                 ("action", "create_token"),
                 ("name", &name),
@@ -202,7 +193,9 @@ pub mod execute {
                 ("decimals", &decimals.to_string()),
                 ("uri", &uri),
                 ("address", human_address.as_str()),
-                ("creator", info.sender.as_str()),
+                ("creator", sender.as_str()),
+                ("max_price_impact", &max_price_impact.to_string()),
+                ("curve_slope", &curve_slope.to_string()),
             ]))
     }
 
@@ -256,9 +249,23 @@ pub mod execute {
         ]))
     }
 
-    pub fn handle_token_creation_reply(_deps: DepsMut, msg: Reply) -> StdResult<Response> {
+    pub fn handle_token_creation_reply(deps: DepsMut, msg: Reply) -> StdResult<Response> {
         let res = cw_utils::parse_instantiate_response_data(&msg.payload).unwrap();
-        Ok(Response::new().add_attribute("token_address", res.contract_address))
+        let token_address = res.contract_address;    
+        let token_info = TOKEN_INFO.load(deps.storage, &token_address)?;
+    
+        let response_data = TokenCreationResponse {
+            token_address: token_address.clone(),
+            name: token_info.name.clone(),
+            symbol: token_info.symbol.clone(),
+            decimals: token_info.decimals,
+            max_price_impact: 100u128.into(),
+            curve_slope: 500u128.into(),
+        };
+    
+        Ok(Response::new()
+            .add_attribute("token_address", token_address)
+            .set_data(to_json_binary(&response_data)?))
     }
 }
 
@@ -277,14 +284,16 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::GetListTokens { start_after, limit } => {
             to_json_binary(&query_list_tokens(deps, start_after, limit)?)
         }
+        QueryMsg::GetConfig { } => {
+            to_json_binary(&query_config(deps)?)
+        }
     }
 }
 
 pub mod query {
     use crate::{
         msg::{
-            GetListTokensResponse, GetOwnerResponse, GetTokenAddressResponse,
-            GetTokenCountResponse, GetTokenInfoResponse, GetTokensByCreatorResponse,
+            GetConfigResponse, GetListTokensResponse, GetOwnerResponse, GetTokenAddressResponse, GetTokenCountResponse, GetTokenInfoResponse, GetTokensByCreatorResponse
         },
         state::{TokenInfo, DEFAULT_LIMIT, MAX_LIMIT, TOKEN_ADDRESS, TOKEN_INFO},
     };
@@ -366,6 +375,14 @@ pub mod query {
 
         Ok(GetListTokensResponse { tokens })
     }
+
+    pub fn query_config(
+        deps: Deps
+    ) -> StdResult<GetConfigResponse> {
+        let config = STATE.load(deps.storage)?;
+
+        Ok(GetConfigResponse { config })
+    }
 }
 
 #[cfg(test)]
@@ -445,6 +462,8 @@ mod tests {
                 address: env.contract.address.to_string(),
                 amount: Uint128::new(1000 * 10_i32.pow(9) as u128),
             }],
+            max_price_impact: 10u128.into(),
+            curve_slope: 500u128.into(),
         };
 
         // Execute the CreateToken message

@@ -1,7 +1,7 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
-use cosmwasm_std::{Addr, HexBinary};
+use cosmwasm_std::{Addr, HexBinary, Uint128};
 
-use crate::state::{Cw20Coin, TokenInfo};
+use crate::state::{Cw20Coin, State, TokenInfo};
 
 #[cw_serde]
 pub struct InstantiateMsg {
@@ -16,6 +16,8 @@ pub enum ExecuteMsg {
         symbol: String,
         decimals: u8,
         uri: String,
+        max_price_impact: Uint128, 
+        curve_slope: Uint128,
         initial_balances: Vec<Cw20Coin>,
     },
     TransferOwnership {
@@ -45,6 +47,8 @@ pub enum QueryMsg {
         start_after: Option<String>,
         limit: Option<u32>,
     },
+    #[returns(GetConfigResponse)]
+    GetConfig {},
 }
 
 // We define a custom struct for each query response
@@ -76,4 +80,9 @@ pub struct GetOwnerResponse {
 #[cw_serde]
 pub struct GetListTokensResponse {
     pub tokens: Vec<TokenInfo>,
+}
+
+#[cw_serde]
+pub struct GetConfigResponse {
+    pub config: State,
 }

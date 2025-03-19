@@ -34,6 +34,16 @@ pub struct TokenInfo {
     pub total_supply: Uint128,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct TokenCreationResponse {
+    pub token_address: String,
+    pub name: String,
+    pub symbol: String,
+    pub decimals: u8,
+    pub max_price_impact: Uint128,
+    pub curve_slope: Uint128,
+}
+
 pub const STATE: Item<State> = Item::new("state");
 pub const TOKEN_INFO: Map<&str, TokenInfo> = Map::new("token_info");
 pub const TOKEN_ADDRESS: Map<(&str, &str), Addr> = Map::new("token_address");

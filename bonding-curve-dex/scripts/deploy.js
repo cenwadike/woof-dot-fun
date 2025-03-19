@@ -26,13 +26,13 @@ async function main() {
     }
   );
 
-  // const wasmCode = readFileSync(wasmFilePath);
-  // const uploadReceipt = await client.upload(firstAccount.address, wasmCode, "auto");
-  // console.log("Upload successful, code ID:", uploadReceipt.codeId);
+  const wasmCode = readFileSync(wasmFilePath);
+  const uploadReceipt = await client.upload(firstAccount.address, wasmCode, "auto");
+  console.log("Upload successful, code ID:", uploadReceipt.codeId);
 
   const initMsg = {
-    token_factory: "neutron15e8pmchvjyx3uecc9zqt82c90vxghgxcu6chexwuwggp4yh5tdkq36mc5w",
-    fee_collector: JSON.stringify(firstAccount.address),
+    token_factory: "neutron1f3224jexv9qwnvaa3xm772nfnqqrwkualph8cc05h0559yfjmfjqcsgxfd",
+    fee_collector: firstAccount.address.toString(),
     quote_token_total_supply: JSON.stringify(100_000_000_000 * 10**9),
     bonding_curve_supply: JSON.stringify(80_000_000_000 * 10**9),
     lp_supply: JSON.stringify(20_000_000_000 * 10**9),
@@ -44,14 +44,14 @@ async function main() {
 
   const instantiateReceipt = await client.instantiate(
     firstAccount.address, 
-    11034, // uploadReceipt.codeId, 
+    uploadReceipt.codeId, 
     initMsg, 
     "Woof.fun Test", 
     "auto"
   );
   console.log("Contract instantiated at:", instantiateReceipt.contractAddress);
-    // Upload successful, code ID: 11034
-    // Contract instantiated at: neutron1g8d23dxx5haeg0rxt83apptmyl004rh4m7dvtmnzarmlgde29jcqc593ul
+  // Upload successful, code ID: 11154
+  // Contract instantiated at: neutron1y8l8egyqlhnq4h9ph3ggrfwx6hr5vam9dn6t8a350z80hcqjjwus4ckaqe
 }
 
 main().catch(console.error);
