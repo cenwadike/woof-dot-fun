@@ -115,6 +115,13 @@ To set up and explore Woof.Fun locally, follow these steps:
     cargo test
 ```
 
+### Run Frontend:
+
+```bash
+    cd woof-dot-fun-ui
+    npm run dev
+```
+
 ## Conclusion
 
 Woof.Fun brings a fresh take on token creation and trading by integrating a bonding curve model 
